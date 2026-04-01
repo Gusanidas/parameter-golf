@@ -2,7 +2,7 @@
 
 **val_bpb: 1.1108** (5-seed mean, std 0.0013) | **1.8755 nats** | **~15.73 MB** | 8xH100 SXM, 600s | No TTT
 
-I started from [PR #1179](https://github.com/openai/parameter-golf/pull/1179) (KitchenSinkV2 Improved), which gave me the base 11-layer split-bank U-Net with split early/late LRs, MiLe margin loss, cache+backout residual, XSA, and train-data GPTQ int6. On top of that, I ported the fused Triton MLP from [PR #1105](https://github.com/openai/parameter-golf/pull/1105) and the brotli+byte-shuffle compression from [PR #1089](https://github.com/openai/parameter-golf/pull/1089). I also added sigmoid-gated skip connections, increased to 12 layers, and tuned qk_gain to 2.5.
+I started from [PR #1130](https://github.com/openai/parameter-golf/pull/1130) (KitchenSinkV2 Improved), which added split early/late LR banks, MiLe margin loss, cache+backout residual, residual lambdas, bigger bigram/VE, and FA3 on top of the PR #549 stack. On top of that, I ported the fused Triton MLP from [PR #1072](https://github.com/openai/parameter-golf/pull/1072) and the sigmoid-gated skips + brotli+byte-shuffle compression from [PR #1089](https://github.com/openai/parameter-golf/pull/1089). I also increased to 12 layers and tuned qk_gain to 2.5.
 
 The two main contributions of this submission are window attention and mixed seq_len training, described below.
 
