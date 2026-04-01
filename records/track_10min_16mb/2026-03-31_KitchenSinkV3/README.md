@@ -32,7 +32,7 @@ At seq_len=2048 (where all tokens fit in a 512-wide window anyway for most posit
 
 ## Mixed seq_len training
 
-Different GPUs train with different sequence lengths within the same step. In the final configuration, 5 GPUs train at seq_len=2048 and 3 GPUs train at seq_len=6144. The number of sequences per GPU is set so that the total tokens per step stays roughly constant.
+Different GPUs train with different sequence lengths within the same step. In the final configuration, 5 GPUs train at seq_len=2048 and 3 GPUs train at seq_len=6144. The number of sequences per GPU is set so that the total ms per step stays roughly constant.
 
 The idea came from noticing that the sliding-window eval (which uses long sequences) gave substantially better scores than the standard 2048-token eval, but training at long sequence lengths was slow. By having most GPUs train cheaply at 2048 and a few GPUs see long context at 6144, the model gets the best of both: high step throughput from the short-sequence GPUs and long-range learning from the long-sequence ones.
 
