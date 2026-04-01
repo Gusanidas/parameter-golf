@@ -69,17 +69,22 @@ Under the 16,000,000 byte limit.
 
 This submission builds on many contributions from the parameter-golf community:
 
-- **PR #549** (abaybektursun) — base architecture: U-Net skip connections, banked weight matrices, Muon optimizer, LeakyReLU² MLP, SmearGate, EMA, GPTQ int6
-- **PR #414** (abaybektursun) — parallel Muon with reduce-scatter + Newton-Schulz
-- **PR #461** (abaybektursun) — legal score-first test-time training
-- **PR #728** (abaybektursun) — autoregressive self-generated GPTQ calibration data
-- **PR #726 / #1060** — coprime-stride multi-shard data loader, train-data GPTQ calibration
-- **PR #1105** — fused Triton LeakyReLU-squared MLP kernel
-- **PR #1089** — byte-shuffle + brotli compression
-- **PR #1179** — KitchenSinkV2 Improved base (split LR banks, MiLe loss, cache+backout, residual lambdas)
-- **PR #198** (jfprincz) — XSA (cross-head subtracted attention)
-- **PR #287** (jfprincz) — partial RoPE, layerwise LN scale
-- **PR #374** (signalrush) — GPTQ-lite, EMA
+- **Baseline** (modded-nanogpt, @KellerJordan et al.) — Muon optimizer, relu², U-Net skips, softcap, RoPE, Q-gain, ResidMix
+- [modded-nanogpt PR #140](https://github.com/KellerJordan/modded-nanogpt/pull/140) (@ClassicLarry / @snimu) — backout residual
+- **PR #50** (@mattqlf) — sliding window eval
+- **PR #64** (@yesbhautik) — GPTQ-lite (clip percentile search)
+- **PR #89 / #95** (@vmfunc / @MatoTeziTanka) — EMA / SWA
+- **PR #162** (@raahilshah) — BigramHash
+- **PR #287** (@jfprincz) — XSA (cross-head subtracted attention; [arXiv:2603.09078](https://arxiv.org/abs/2603.09078))
+- **PR #315** (@jfprincz) — partial RoPE, layerwise LN scale
+- **PR #374** (@unnir) — value embeddings
+- **PR #399** (@abaybektursun) — parallel Muon with parameter banking
+- **PR #493** (@parinzee) — LeakyReLU(0.5)²
+- **PR #535** (@raahilshah) — full Hessian GPTQ
+- **PR #549** (@abaybektursun) — banked weight matrices, SmearGate
+- **PR #726** (@DeepReinforce) — coprime-stride multi-shard data loader
+- **PR #1072** (@vimeto) — fused Triton LeakyReLU-squared MLP kernel
+- **PR #1089** (@mikeapedia) — sigmoid-gated skip connections, byte-shuffle + brotli compression
 - Flash Attention 3 with `window_size` for efficient window attention
 
 ## Reproducibility
