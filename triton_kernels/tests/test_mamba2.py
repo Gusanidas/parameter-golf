@@ -15,7 +15,8 @@ import torch
 
 from triton_kernels.mamba2_ssd import mamba2_ssd_triton_autograd
 from triton_kernels.mamba2_fused import mamba2_fused_triton_autograd
-from triton_kernels.tests.reference import mamba2_ssd_ref, mamba2_fused_ref
+from triton_kernels.conv1d import causal_conv1d_autograd
+from triton_kernels.tests.reference import causal_conv1d_ref, mamba2_ssd_ref, mamba2_fused_ref
 
 
 def _max_err(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float]:
@@ -84,6 +85,33 @@ def run_ssd(B=2, T=64, H=2, P=32, N=16, seed=0, dtype=torch.float32,
     ok &= _check("dC",    Cm.grad,    Cm2.grad,     atol, rtol)
     ok &= _check("ddt",   dt.grad,    dt2.grad,     atol, rtol)
     ok &= _check("dA_log", A_log.grad, A_log2.grad, atol, rtol)
+    return ok
+
+
+def run_conv(B=2, T=257, H=3, D=64, seed=0, dtype=torch.float32,
+             compiled=False, atol=2e-2, rtol=2e-2) -> bool:
+    device = "cuda"
+    gen = torch.Generator(device=device).manual_seed(seed)
+    x = torch.randn(B, T, H, D, device=device, dtype=dtype, generator=gen).detach().requires_grad_()
+    w = (torch.randn(H, D, 4, device=device, dtype=dtype, generator=gen) * 0.1).detach().requires_grad_()
+    fn = causal_conv1d_autograd
+    if compiled:
+        fn = torch.compile(fn, fullgraph=True)
+    y = fn(x, w)
+    dy = _random_like(y, seed + 30_000)
+    y.backward(dy)
+
+    x2 = x.detach().clone().requires_grad_()
+    w2 = w.detach().clone().requires_grad_()
+    y_ref = causal_conv1d_ref(x2, w2)
+    y_ref.backward(dy.float())
+
+    mode = "compiled" if compiled else "eager"
+    print(f"[CONV] {mode} dtype={dtype} B={B} T={T} H={H} D={D} seed={seed}")
+    ok = True
+    ok &= _check("y", y, y_ref, atol, rtol)
+    ok &= _check("dx", x.grad, x2.grad, atol, rtol)
+    ok &= _check("dw", w.grad, w2.grad, atol, rtol)
     return ok
 
 
@@ -167,6 +195,7 @@ def main() -> int:
     if not torch.cuda.is_available():
         print("CUDA required"); return 2
     all_ok = True
+    all_ok &= run_conv(B=2, T=257, H=3, D=64, seed=7, compiled=True)
     all_ok &= run_ssd(B=1, T=64,  H=1, P=32, N=16, seed=0)
     all_ok &= run_ssd(B=2, T=128, H=2, P=64, N=16, seed=1, compiled=True)
     all_ok &= run_fused(B=1, T=64,  H=1, P=32, N=16, seed=0)

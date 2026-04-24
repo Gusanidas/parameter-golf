@@ -529,10 +529,9 @@ class Mamba2Layer(nn.Module):
         dt_raw = proj[..., 2 * H * P + 2 * H * N:]
         dt = F.softplus(dt_raw.float() + self.dt_bias)
         if self.use_fused:
-            x_skip = F.silu(causal_conv1d_autograd(x_ssm, self.conv_w_x))
             y = mamba2_fused_triton_autograd(
                 x_ssm, self.A_log, Bm, Cm, dt,
-                self.conv_w_x, self.conv_w_b, self.conv_w_c,
+                self.conv_w_x, self.conv_w_b, self.conv_w_c, self.D,
             )
         else:
             x_ssm = F.silu(causal_conv1d_autograd(x_ssm, self.conv_w_x))
@@ -540,7 +539,7 @@ class Mamba2Layer(nn.Module):
             Cm = F.silu(causal_conv1d_autograd(Cm, self.conv_w_c))
             x_skip = x_ssm
             y = mamba2_ssd_triton_autograd(x_ssm, self.A_log, Bm, Cm, dt)
-        y = y + x_skip * self.D.to(dtype=y.dtype)[None, None, :, None]
+            y = y + x_skip * self.D.to(dtype=y.dtype)[None, None, :, None]
         y = F.rms_norm(y, (P,), self.norm_weight.to(dtype=y.dtype)) * F.silu(z)
         y = y.reshape(B_sz, T_pad, H * P)
         y = self.out_proj(y.to(x.dtype))

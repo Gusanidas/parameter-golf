@@ -30,7 +30,7 @@ from .conv1d import causal_conv1d_triton_bwd
 @triton.jit
 def _mamba2_fused_fwd(
     # Raw inputs (pre-conv)
-    X, B_IN, C_IN, DT, A_LOG,
+    X, B_IN, C_IN, DT, A_LOG, D_SKIP,
     # Conv weights: [H, D, 4] layout, contiguous
     CONV_WX, CONV_WB, CONV_WC,
     # Outputs
@@ -57,6 +57,7 @@ def _mamba2_fused_fwd(
     h = pid % nheads
 
     A_h = -tl.exp(tl.load(A_LOG + h).to(tl.float32))
+    D_h = tl.load(D_SKIP + h).to(tl.float32)
     state = tl.zeros((SDIM, HDIM), dtype=tl.float32)
 
     c_offs = tl.arange(0, CHUNK)
@@ -146,7 +147,7 @@ def _mamba2_fused_fwd(
         attn = qk * tl.exp(decay_diff)
         y_intra = tl.dot(attn, x_c, input_precision="tf32")
 
-        y_chunk = y_state + y_intra
+        y_chunk = y_state + y_intra + x_c * D_h
         y_ptrs = Y + b * s_yb + (t0 + c_offs[:, None]) * s_yt + h * s_yh + d_offs[None, :] * s_yd
         tl.store(y_ptrs, y_chunk)
 
@@ -173,7 +174,7 @@ def _mamba2_fused_fwd(
 @triton.jit
 def _mamba2_fused_bwd(
     # Raw inputs (still needed for conv_bwd elsewhere; strides reused for CONV_* too)
-    X, B_IN, C_IN, DT, A_LOG,
+    X, B_IN, C_IN, DT, A_LOG, D_SKIP,
     # Conv weights
     CONV_WX, CONV_WB, CONV_WC,
     # Saved states
@@ -183,7 +184,7 @@ def _mamba2_fused_bwd(
     # Output: gradients w.r.t. conv outputs (before conv transpose)
     D_CONV_X, D_CONV_B, D_CONV_C,
     # Output: gradient w.r.t. dt
-    DDT,
+    DDT, DD_SKIP,
     # X strides [B, T, H, P]
     s_xb, s_xt, s_xh, s_xd,
     # B strides [B, T, H, N]
@@ -212,6 +213,7 @@ def _mamba2_fused_bwd(
     h = pid % nheads
 
     A_h = -tl.exp(tl.load(A_LOG + h).to(tl.float32))
+    D_h = tl.load(D_SKIP + h).to(tl.float32)
 
     c_offs = tl.arange(0, CHUNK)
     d_offs = tl.arange(0, HDIM)
@@ -372,6 +374,10 @@ def _mamba2_fused_bwd(
         tl.store(DDT + b * s_ddb + t_abs * s_ddt_ + h * s_ddh, d_dt)
 
         # ══════════════════════════════════════════════════════════════
+        # Add gradient from the fused D skip: y += D[h] * x_c.
+        dx_ssm = dx_ssm + dy * D_h
+        tl.atomic_add(DD_SKIP + h, tl.sum(dy * x_c))
+
         # Step 3: SiLU backward → d_conv
         # silu(z) = z * sigmoid(z)
         # d_silu/dz = sig * (1 + z * (1 - sig))
@@ -393,7 +399,7 @@ def _mamba2_fused_bwd(
 @torch.library.custom_op("mamba2t::fused_fwd", mutates_args=())
 def _mamba2t_fused_fwd(
     x: Tensor, A_log: Tensor, B: Tensor, C: Tensor, dt: Tensor,
-    conv_w_x: Tensor, conv_w_b: Tensor, conv_w_c: Tensor,
+    conv_w_x: Tensor, conv_w_b: Tensor, conv_w_c: Tensor, D_skip: Tensor,
 ) -> tuple[Tensor, Tensor]:
     """Fused conv+SiLU+SSD forward. Returns (y, states).
 
@@ -410,7 +416,7 @@ def _mamba2t_fused_fwd(
     states = torch.empty(Bsz, H, NC + 1, N, P, device=x.device, dtype=torch.float32)
     grid = (Bsz * H,)
     _mamba2_fused_fwd[grid](
-        x, B, C, dt, A_log,
+        x, B, C, dt, A_log, D_skip,
         conv_w_x, conv_w_b, conv_w_c,
         y, states,
         *x.stride(), *B.stride(), *C.stride(), *dt.stride(),
@@ -422,7 +428,7 @@ def _mamba2t_fused_fwd(
 
 
 @torch.library.register_fake("mamba2t::fused_fwd")
-def _mamba2t_fused_fwd_fake(x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_c):
+def _mamba2t_fused_fwd_fake(x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_c, D_skip):
     Bsz, T, H, P = x.shape
     N = B.shape[-1]
     NC = T // 64
@@ -435,9 +441,9 @@ def _mamba2t_fused_fwd_fake(x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_c):
 def _mamba2t_fused_bwd(
     dy: Tensor, x: Tensor, A_log: Tensor, B: Tensor, C: Tensor,
     dt: Tensor, states: Tensor,
-    conv_w_x: Tensor, conv_w_b: Tensor, conv_w_c: Tensor,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Fused backward. Returns (dx, dA_log, dB, dC, ddt, d_conv_w_x, d_conv_w_b, d_conv_w_c)."""
+    conv_w_x: Tensor, conv_w_b: Tensor, conv_w_c: Tensor, D_skip: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Fused backward. Returns (dx, dA_log, dB, dC, ddt, d_conv_w_x, d_conv_w_b, d_conv_w_c, dD)."""
     Bsz, T, H, P = x.shape
     N = B.shape[-1]
     CS = 64
@@ -449,13 +455,14 @@ def _mamba2t_fused_bwd(
     d_conv_b = torch.empty(B.shape, device=B.device, dtype=B.dtype)
     d_conv_c = torch.empty(C.shape, device=C.device, dtype=C.dtype)
     ddt = dt.new_empty(dt.shape)
+    dD = torch.zeros_like(D_skip)
 
     grid = (Bsz * H,)
     _mamba2_fused_bwd[grid](
-        x, B, C, dt, A_log,
+        x, B, C, dt, A_log, D_skip,
         conv_w_x, conv_w_b, conv_w_c,
         states, dy,
-        d_conv_x, d_conv_b, d_conv_c, ddt,
+        d_conv_x, d_conv_b, d_conv_c, ddt, dD,
         *x.stride(), *B.stride(), *C.stride(), *dt.stride(),
         *states.stride(), *dy.stride(),
         *d_conv_x.stride(), *d_conv_b.stride(), *d_conv_c.stride(),
@@ -469,11 +476,11 @@ def _mamba2t_fused_bwd(
     dC, d_cwc = causal_conv1d_triton_bwd(d_conv_c, C, conv_w_c)
 
     dA_log = (ddt * dt).sum(dim=(0, 1))  # [H]
-    return dx, dA_log, dB, dC, ddt, d_cwx, d_cwb, d_cwc
+    return dx, dA_log, dB, dC, ddt, d_cwx, d_cwb, d_cwc, dD
 
 
 @torch.library.register_fake("mamba2t::fused_bwd")
-def _mamba2t_fused_bwd_fake(dy, x, A_log, B, C, dt, states, conv_w_x, conv_w_b, conv_w_c):
+def _mamba2t_fused_bwd_fake(dy, x, A_log, B, C, dt, states, conv_w_x, conv_w_b, conv_w_c, D_skip):
     return (
         x.new_empty(x.shape),
         A_log.new_empty(A_log.shape),
@@ -483,22 +490,23 @@ def _mamba2t_fused_bwd_fake(dy, x, A_log, B, C, dt, states, conv_w_x, conv_w_b, 
         conv_w_x.new_empty(conv_w_x.shape),
         conv_w_b.new_empty(conv_w_b.shape),
         conv_w_c.new_empty(conv_w_c.shape),
+        D_skip.new_empty(D_skip.shape),
     )
 
 
 def _fused_autograd_bwd(ctx, do, d_states):
-    x, A_log, B, C, dt, states, conv_w_x, conv_w_b, conv_w_c = ctx.saved_tensors
-    dx, dA_log, dB, dC, ddt, d_cwx, d_cwb, d_cwc = torch.ops.mamba2t.fused_bwd(
+    x, A_log, B, C, dt, states, conv_w_x, conv_w_b, conv_w_c, D_skip = ctx.saved_tensors
+    dx, dA_log, dB, dC, ddt, d_cwx, d_cwb, d_cwc, dD = torch.ops.mamba2t.fused_bwd(
         do, x, A_log, B, C, dt, states,
-        conv_w_x, conv_w_b, conv_w_c,
+        conv_w_x, conv_w_b, conv_w_c, D_skip,
     )
-    return dx, dA_log, dB, dC, ddt, d_cwx, d_cwb, d_cwc
+    return dx, dA_log, dB, dC, ddt, d_cwx, d_cwb, d_cwc, dD
 
 
 def _fused_autograd_setup(ctx, inputs, output):
-    x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_c = inputs
+    x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_c, D_skip = inputs
     y, states = output
-    ctx.save_for_backward(x, A_log, B, C, dt, states, conv_w_x, conv_w_b, conv_w_c)
+    ctx.save_for_backward(x, A_log, B, C, dt, states, conv_w_x, conv_w_b, conv_w_c, D_skip)
 
 
 torch.library.register_autograd(
@@ -506,7 +514,8 @@ torch.library.register_autograd(
 )
 
 
-def mamba2_fused_triton_autograd(x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_c, chunk_size=64):
+def mamba2_fused_triton_autograd(x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_c,
+                                 D_skip=None, chunk_size=64):
     """Fused conv1d + SiLU + SSD via single Triton kernel (fullgraph=True safe).
 
     Forward: 1 kernel (conv+SiLU+SSD fused)
@@ -526,5 +535,9 @@ def mamba2_fused_triton_autograd(x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_
         y: [B, T, H, P] output
     """
     assert chunk_size == 64, "Only chunk_size=64 supported"
-    y, _states = torch.ops.mamba2t.fused_fwd(x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_c)
+    if D_skip is None:
+        D_skip = A_log.new_zeros(A_log.shape)
+    y, _states = torch.ops.mamba2t.fused_fwd(
+        x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_c, D_skip,
+    )
     return y

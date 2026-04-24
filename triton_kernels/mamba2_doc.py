@@ -192,8 +192,9 @@ def _fused_fwd_doc(
     if not docs:
         return y
     xb, Bb, Cb, dtb = _pack_docs(x, B, C, dt, docs, max_L_pad)
+    D_skip = A_log.new_zeros(A_log.shape)
     yb, _ = torch.ops.mamba2t.fused_fwd(
-        xb, A_log, Bb, Cb, dtb, conv_w_x, conv_w_b, conv_w_c,
+        xb, A_log, Bb, Cb, dtb, conv_w_x, conv_w_b, conv_w_c, D_skip,
     )
     _unpack(y, yb, docs)
     return y
@@ -226,13 +227,14 @@ def _fused_bwd_doc(
         return dx, dA_log, dB, dC, ddt, d_cwx, d_cwb, d_cwc
     xb, Bb, Cb, dtb = _pack_docs(x, B, C, dt, docs, max_L_pad)
     dyb = _pack_dy(dy, docs, max_L_pad)
+    D_skip = A_log.new_zeros(A_log.shape)
     _yb, statesb = torch.ops.mamba2t.fused_fwd(
-        xb, A_log, Bb, Cb, dtb, conv_w_x, conv_w_b, conv_w_c,
+        xb, A_log, Bb, Cb, dtb, conv_w_x, conv_w_b, conv_w_c, D_skip,
     )
     (dxb, dA_log_b, dBb, dCb, ddtb,
-     d_cwx_b, d_cwb_b, d_cwc_b) = torch.ops.mamba2t.fused_bwd(
+     d_cwx_b, d_cwb_b, d_cwc_b, _dD_b) = torch.ops.mamba2t.fused_bwd(
         dyb, xb, A_log, Bb, Cb, dtb, statesb,
-        conv_w_x, conv_w_b, conv_w_c,
+        conv_w_x, conv_w_b, conv_w_c, D_skip,
     )
     _unpack(dx, dxb, docs)
     _unpack(dB, dBb, docs)
