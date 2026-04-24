@@ -23,6 +23,7 @@ import torch.nn.functional as F
 
 from triton_kernels.mamba2_ssd import mamba2_ssd_triton_autograd
 from triton_kernels.mamba2_fused import mamba2_fused_triton_autograd
+from triton_kernels.conv1d import causal_conv1d_autograd
 from triton_kernels.bench._common import (
     RMSNorm, MLP, time_fwd_bwd, run_profiler_trace,
 )
@@ -44,13 +45,17 @@ class Mamba2Layer(nn.Module):
         H, P, N = num_heads, head_dim, state_dim
         self.in_proj = nn.Linear(dim, 2 * H * P + 2 * H * N + H, bias=False)
         self.out_proj = nn.Linear(H * P, dim, bias=False)
-        self.A_log = nn.Parameter(torch.linspace(-3.0, -1.0, H).float())
-        self.dt_bias = nn.Parameter(torch.zeros(H).float())
-        self.norm = RMSNorm()
-        if variant == "fused":
-            self.conv_w_x = nn.Parameter(torch.randn(H, P, 4) * 0.1)
-            self.conv_w_b = nn.Parameter(torch.randn(H, N, 4) * 0.1)
-            self.conv_w_c = nn.Parameter(torch.randn(H, N, 4) * 0.1)
+        self.A_log = nn.Parameter(torch.empty(H, dtype=torch.float32).uniform_(0.0, math.log(16.0)))
+        dt = torch.exp(
+            torch.rand(H, dtype=torch.float32) * (math.log(0.1) - math.log(0.001))
+            + math.log(0.001)
+        ).clamp(min=1e-4)
+        self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
+        self.D = nn.Parameter(torch.ones(H, dtype=torch.float32))
+        self.norm_weight = nn.Parameter(torch.ones(P, dtype=torch.float32))
+        self.conv_w_x = nn.Parameter(torch.randn(H, P, 4) * 0.1)
+        self.conv_w_b = nn.Parameter(torch.randn(H, N, 4) * 0.1)
+        self.conv_w_c = nn.Parameter(torch.randn(H, N, 4) * 0.1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, _ = x.shape
@@ -63,13 +68,19 @@ class Mamba2Layer(nn.Module):
         dt_raw = proj[..., 2 * H * P + 2 * H * N:]
         dt = F.softplus(dt_raw.float() + self.dt_bias)
         if self.variant == "fused":
+            x_skip = F.silu(causal_conv1d_autograd(x_ssm, self.conv_w_x))
             y = mamba2_fused_triton_autograd(
                 x_ssm, self.A_log, Bm, Cm, dt,
                 self.conv_w_x, self.conv_w_b, self.conv_w_c,
             )
         else:
+            x_ssm = F.silu(causal_conv1d_autograd(x_ssm, self.conv_w_x))
+            Bm = F.silu(causal_conv1d_autograd(Bm, self.conv_w_b))
+            Cm = F.silu(causal_conv1d_autograd(Cm, self.conv_w_c))
+            x_skip = x_ssm
             y = mamba2_ssd_triton_autograd(x_ssm, self.A_log, Bm, Cm, dt)
-        y = self.norm(y) * F.silu(z)
+        y = y + x_skip * self.D.to(dtype=y.dtype)[None, None, :, None]
+        y = F.rms_norm(y, (P,), self.norm_weight.to(dtype=y.dtype)) * F.silu(z)
         return self.out_proj(y.to(x.dtype).reshape(B, T, H * P))
 
 

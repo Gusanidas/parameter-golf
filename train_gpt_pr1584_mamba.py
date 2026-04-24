@@ -4,6 +4,8 @@ import random, re, subprocess, sys, time, uuid, numpy as np, sentencepiece as sp
 from torch import Tensor, nn
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
 from triton_kernels import (
+    causal_conv1d_autograd,
+    kda_triton_autograd,
     mamba2_ssd_triton_autograd,
     mamba2_fused_triton_autograd,
 )
@@ -151,9 +153,15 @@ class Hyperparameters:
     mamba2_num_heads = int(os.environ.get('MAMBA2_NUM_HEADS', 6))
     mamba2_head_dim = int(os.environ.get('MAMBA2_HEAD_DIM', 64))
     mamba2_state_dim = int(os.environ.get('MAMBA2_STATE_DIM', 16))
-    mamba2_a_log_min = float(os.environ.get('MAMBA2_A_LOG_MIN', -3.0))
-    mamba2_a_log_max = float(os.environ.get('MAMBA2_A_LOG_MAX', -1.0))
+    mamba2_a_log_min = float(os.environ.get('MAMBA2_A_LOG_MIN', 0.0))
+    mamba2_a_log_max = float(os.environ.get('MAMBA2_A_LOG_MAX', math.log(16.0)))
     mamba2_use_fused = bool(int(os.environ.get('MAMBA2_USE_FUSED', '1')))
+    kda_layers = os.environ.get('KDA_LAYERS', '')
+    kda_num_heads = int(os.environ.get('KDA_NUM_HEADS', 8))
+    kda_head_dim = int(os.environ.get('KDA_HEAD_DIM', 64))
+    kda_value_dim = int(os.environ.get('KDA_VALUE_DIM', os.environ.get('KDA_HEAD_DIM', 64)))
+    kda_use_short_conv = bool(int(os.environ.get('KDA_USE_SHORT_CONV', '1')))
+    kda_allow_neg_eigval = bool(int(os.environ.get('KDA_ALLOW_NEG_EIGVAL', '0')))
     min_lr = float(os.environ.get('MIN_LR', 0.0))
     embed_lr = float(os.environ.get('EMBED_LR', 0.6))
     head_lr = float(os.environ.get('HEAD_LR', 0.008))
@@ -471,6 +479,9 @@ class Mamba2Layer(nn.Module):
     """Mamba2 SSD block: in_proj -> SSD kernel -> norm*silu(z) -> out_proj.
     H heads of width P (independent of model_dim via out_proj). Uses fused
     conv+SSD Triton kernel when use_fused=True.
+
+    This follows the training-time FLA Mamba2 layout for the no-extra-MLP case:
+    in_proj -> gate + conv(x/B/C) + dt -> SSD + D skip -> RMSNormGated -> out_proj.
     """
     def __init__(self, dim, num_heads, head_dim, state_dim=16,
                  a_log_min=-3.0, a_log_max=-1.0, use_fused=True):
@@ -485,10 +496,19 @@ class Mamba2Layer(nn.Module):
         self.in_proj = nn.Linear(dim, 2 * H * P + 2 * H * N + H, bias=False)
         self.out_proj = nn.Linear(self.ssm_dim, dim, bias=False)
         self.out_proj._zero_init = True
-        self.A_log = nn.Parameter(torch.linspace(a_log_min, a_log_max, H).float())
-        self.dt_bias = nn.Parameter(torch.zeros(H).float())
-        self.norm = RMSNorm()
+        self.A_log = nn.Parameter(torch.empty(H, dtype=torch.float32).uniform_(a_log_min, a_log_max))
+        dt = torch.exp(
+            torch.rand(H, dtype=torch.float32) * (math.log(0.1) - math.log(0.001))
+            + math.log(0.001)
+        ).clamp(min=1e-4)
+        self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
+        self.D = nn.Parameter(torch.ones(H, dtype=torch.float32))
+        self.norm_weight = nn.Parameter(torch.ones(P, dtype=torch.float32))
         if use_fused:
+            self.conv_w_x = nn.Parameter(torch.randn(H, P, 4) * 0.1)
+            self.conv_w_b = nn.Parameter(torch.randn(H, N, 4) * 0.1)
+            self.conv_w_c = nn.Parameter(torch.randn(H, N, 4) * 0.1)
+        else:
             self.conv_w_x = nn.Parameter(torch.randn(H, P, 4) * 0.1)
             self.conv_w_b = nn.Parameter(torch.randn(H, N, 4) * 0.1)
             self.conv_w_c = nn.Parameter(torch.randn(H, N, 4) * 0.1)
@@ -509,18 +529,94 @@ class Mamba2Layer(nn.Module):
         dt_raw = proj[..., 2 * H * P + 2 * H * N:]
         dt = F.softplus(dt_raw.float() + self.dt_bias)
         if self.use_fused:
+            x_skip = F.silu(causal_conv1d_autograd(x_ssm, self.conv_w_x))
             y = mamba2_fused_triton_autograd(
                 x_ssm, self.A_log, Bm, Cm, dt,
                 self.conv_w_x, self.conv_w_b, self.conv_w_c,
             )
         else:
+            x_ssm = F.silu(causal_conv1d_autograd(x_ssm, self.conv_w_x))
+            Bm = F.silu(causal_conv1d_autograd(Bm, self.conv_w_b))
+            Cm = F.silu(causal_conv1d_autograd(Cm, self.conv_w_c))
+            x_skip = x_ssm
             y = mamba2_ssd_triton_autograd(x_ssm, self.A_log, Bm, Cm, dt)
-        y = self.norm(y) * F.silu(z)
+        y = y + x_skip * self.D.to(dtype=y.dtype)[None, None, :, None]
+        y = F.rms_norm(y, (P,), self.norm_weight.to(dtype=y.dtype)) * F.silu(z)
         y = y.reshape(B_sz, T_pad, H * P)
         y = self.out_proj(y.to(x.dtype))
         if T_pad != T:
             y = y[:, :T]
         return y
+
+
+class KDALayer(nn.Module):
+    """FLA-shaped Kimi Delta Attention mixer for training.
+
+    Projection/gating live at the layer level; the custom op only handles the
+    chunked KDA recurrence over projected q/k/v/g/beta.
+    """
+    def __init__(self, dim, num_heads, head_dim, value_dim=None,
+                 use_short_conv=True, allow_neg_eigval=False):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.value_dim = value_dim if value_dim is not None else head_dim
+        self.use_short_conv = use_short_conv
+        self.allow_neg_eigval = allow_neg_eigval
+        H, K, V = num_heads, head_dim, self.value_dim
+        self.q_proj = nn.Linear(dim, H * K, bias=False)
+        self.k_proj = nn.Linear(dim, H * K, bias=False)
+        self.v_proj = nn.Linear(dim, H * V, bias=False)
+        self.f_proj = nn.Sequential(
+            nn.Linear(dim, V, bias=False),
+            nn.Linear(V, H * K, bias=False),
+        )
+        self.b_proj = nn.Linear(dim, H, bias=False)
+        self.g_proj = nn.Sequential(
+            nn.Linear(dim, V, bias=False),
+            nn.Linear(V, H * V, bias=True),
+        )
+        self.o_norm_weight = nn.Parameter(torch.ones(V, dtype=torch.float32))
+        self.o_proj = nn.Linear(H * V, dim, bias=False)
+        self.o_proj._zero_init = True
+        self.A_log = nn.Parameter(torch.empty(H, dtype=torch.float32).uniform_(1.0, 16.0).log())
+        dt = torch.exp(
+            torch.rand(H * K, dtype=torch.float32) * (math.log(0.1) - math.log(0.001))
+            + math.log(0.001)
+        ).clamp(min=1e-4)
+        self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
+        if use_short_conv:
+            self.q_conv_w = nn.Parameter(torch.randn(H, K, 4) * 0.1)
+            self.k_conv_w = nn.Parameter(torch.randn(H, K, 4) * 0.1)
+            self.v_conv_w = nn.Parameter(torch.randn(H, V, 4) * 0.1)
+
+    def forward(self, x):
+        B_sz, T, _ = x.shape
+        H, K, V = self.num_heads, self.head_dim, self.value_dim
+        q = self.q_proj(x).reshape(B_sz, T, H, K)
+        k = self.k_proj(x).reshape(B_sz, T, H, K)
+        v = self.v_proj(x).reshape(B_sz, T, H, V)
+        if self.use_short_conv:
+            q = F.silu(causal_conv1d_autograd(q, self.q_conv_w))
+            k = F.silu(causal_conv1d_autograd(k, self.k_conv_w))
+            v = F.silu(causal_conv1d_autograd(v, self.v_conv_w))
+        else:
+            q = F.silu(q)
+            k = F.silu(k)
+            v = F.silu(v)
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        g_raw = self.f_proj(x).reshape(B_sz, T, H, K)
+        dt_bias = self.dt_bias.reshape(H, K)
+        g = -torch.exp(self.A_log.float())[None, None, :, None] * F.softplus(g_raw.float() + dt_bias)
+        beta = torch.sigmoid(self.b_proj(x).float())
+        if self.allow_neg_eigval:
+            beta = beta * 2.0
+        y = kda_triton_autograd(q, k, v, g, beta)
+        gate = self.g_proj(x).reshape(B_sz, T, H, V)
+        y = F.rms_norm(y, (V,), self.o_norm_weight.to(dtype=y.dtype)) * torch.sigmoid(gate)
+        return self.o_proj(y.to(x.dtype).reshape(B_sz, T, H * V))
 
 
 class _MambaAttnAdapter(nn.Module):
@@ -535,6 +631,18 @@ class _MambaAttnAdapter(nn.Module):
 
     def forward(self, x, q_w=None, k_w=None, v_w=None, out_w=None):
         return self.mamba(x)
+
+
+class _KDAAttnAdapter(nn.Module):
+    """Adapter so KDA blocks share the attention block call signature."""
+    def __init__(self, kda_layer):
+        super().__init__()
+        self.kda = kda_layer
+        self.use_xsa = False
+        self._calib = False
+
+    def forward(self, x, q_w=None, k_w=None, v_w=None, out_w=None):
+        return self.kda(x)
 
 
 class Mamba2Block(nn.Module):
@@ -552,6 +660,45 @@ class Mamba2Block(nn.Module):
         self.attn = _MambaAttnAdapter(Mamba2Layer(
             dim, num_heads, head_dim, state_dim=state_dim,
             a_log_min=a_log_min, a_log_max=a_log_max, use_fused=use_fused))
+        self.mlp = MLP(dim, mlp_mult)
+        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+
+    def forward(self, x, x0, q_w, k_w, v_w, out_w, up_w, down_w):
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor)
+        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(
+            self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        return x_out
+
+    def forward_attn(self, x, x0, q_w, k_w, v_w, out_w):
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor)
+        return x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+
+    def forward_mlp(self, x, up_w, down_w):
+        return x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(
+            self.mlp_norm(x) * self.ln_scale_factor, up_w, down_w)
+
+
+class KDABlock(nn.Module):
+    """Drop-in replacement for Block using KDA instead of attention."""
+    def __init__(self, dim, num_heads, head_dim, value_dim, mlp_mult,
+                 use_short_conv=True, allow_neg_eigval=False,
+                 layer_idx=0, ln_scale=False):
+        super().__init__()
+        self.attn_norm = RMSNorm()
+        self.mlp_norm = RMSNorm()
+        self.attn = _KDAAttnAdapter(KDALayer(
+            dim, num_heads, head_dim, value_dim=value_dim,
+            use_short_conv=use_short_conv,
+            allow_neg_eigval=allow_neg_eigval,
+        ))
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -629,10 +776,15 @@ class GPT(nn.Module):
         kv_dim = h.num_kv_heads * head_dim
         hidden_dim = int(h.mlp_mult * h.model_dim)
         self.mamba2_layer_set = set(int(s) for s in h.mamba2_layers.split(',') if s.strip())
+        self.kda_layer_set = set(int(s) for s in h.kda_layers.split(',') if s.strip())
+        overlap = self.mamba2_layer_set & self.kda_layer_set
+        if overlap:
+            raise ValueError(f"Layers cannot be both Mamba2 and KDA: {sorted(overlap)}")
+        mixer_layer_set = self.mamba2_layer_set | self.kda_layer_set
         attn_bank_slot = []
         slot = 0
         for i in range(h.num_layers):
-            if i in self.mamba2_layer_set:
+            if i in mixer_layer_set:
                 attn_bank_slot.append(-1)
             else:
                 attn_bank_slot.append(slot); slot += 1
@@ -652,6 +804,12 @@ class GPT(nn.Module):
                     state_dim=h.mamba2_state_dim, mlp_mult=h.mlp_mult,
                     a_log_min=h.mamba2_a_log_min, a_log_max=h.mamba2_a_log_max,
                     use_fused=h.mamba2_use_fused, layer_idx=i, ln_scale=h.ln_scale)
+            if i in self.kda_layer_set:
+                return KDABlock(
+                    h.model_dim, h.kda_num_heads, h.kda_head_dim, h.kda_value_dim,
+                    mlp_mult=h.mlp_mult, use_short_conv=h.kda_use_short_conv,
+                    allow_neg_eigval=h.kda_allow_neg_eigval,
+                    layer_idx=i, ln_scale=h.ln_scale)
             return Block(h.model_dim, h.num_heads, h.num_kv_heads, h.mlp_mult,
                          h.rope_base, h.qk_gain_init, h.train_seq_len,
                          layer_idx=i, ln_scale=h.ln_scale)
@@ -659,7 +817,7 @@ class GPT(nn.Module):
         if h.rope_dims > 0:
             head_dim = h.model_dim // h.num_heads
             for block in self.blocks:
-                if isinstance(block, Mamba2Block):
+                if isinstance(block, (Mamba2Block, KDABlock)):
                     continue
                 block.attn.rope_dims = h.rope_dims
                 block.attn.rotary = Rotary(head_dim, base=h.rope_base, train_seq_len=h.train_seq_len, rope_dims=h.rope_dims)
@@ -669,7 +827,7 @@ class GPT(nn.Module):
             self.lm_head._zero_init = True
         if h.xsa_last_n > 0:
             for i in range(max(0, h.num_layers - h.xsa_last_n), h.num_layers):
-                if not isinstance(self.blocks[i], Mamba2Block):
+                if not isinstance(self.blocks[i], (Mamba2Block, KDABlock)):
                     self.blocks[i].attn.use_xsa = True
         self.looping_active = False
         if h.num_loops > 0:
@@ -1032,9 +1190,16 @@ class Optimizers:
         matrix_params = [base_model.qo_bank, base_model.kv_bank, base_model.mlp_up_bank, base_model.mlp_down_bank]
         block_named_params = list(base_model.blocks.named_parameters())
         for name, p in block_named_params:
-            if '.mamba.' in name and p.ndim == 2:
+            if ('.mamba.' in name or '.kda.' in name) and p.ndim == 2:
                 matrix_params.append(p)
-        scalar_params = [p for name, p in block_named_params if (p.ndim < 2 or any((pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))) or ('.mamba.' in name and p.ndim >= 3)]
+        scalar_params = [
+            p for name, p in block_named_params
+            if (
+                p.ndim < 2
+                or any((pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
+                or (('.mamba.' in name or '.kda.' in name) and p.ndim >= 3)
+            )
+        ]
         if base_model.skip_weights.numel() > 0:
             scalar_params.append(base_model.skip_weights)
         if base_model.skip_gates is not None and base_model.skip_gates.numel() > 0:
@@ -1176,7 +1341,7 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
     hooks = []
     n = model.num_layers
     for i, block in enumerate(model.blocks):
-        if not isinstance(block, Mamba2Block):
+        if not isinstance(block, (Mamba2Block, KDABlock)):
             block.attn._calib = True
         block.mlp._calib = True
 
@@ -1238,6 +1403,26 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
                 make_linear_hook(f'blocks.{i}.attn.mamba.in_proj.weight')))
             hooks.append(block.attn.mamba.out_proj.register_forward_hook(
                 make_linear_hook(f'blocks.{i}.attn.mamba.out_proj.weight')))
+        elif isinstance(block, KDABlock):
+            kda = block.attn.kda
+            hooks.append(kda.q_proj.register_forward_hook(
+                make_linear_hook(f'blocks.{i}.attn.kda.q_proj.weight')))
+            hooks.append(kda.k_proj.register_forward_hook(
+                make_linear_hook(f'blocks.{i}.attn.kda.k_proj.weight')))
+            hooks.append(kda.v_proj.register_forward_hook(
+                make_linear_hook(f'blocks.{i}.attn.kda.v_proj.weight')))
+            hooks.append(kda.b_proj.register_forward_hook(
+                make_linear_hook(f'blocks.{i}.attn.kda.b_proj.weight')))
+            hooks.append(kda.f_proj[0].register_forward_hook(
+                make_linear_hook(f'blocks.{i}.attn.kda.f_proj.0.weight')))
+            hooks.append(kda.f_proj[1].register_forward_hook(
+                make_linear_hook(f'blocks.{i}.attn.kda.f_proj.1.weight')))
+            hooks.append(kda.g_proj[0].register_forward_hook(
+                make_linear_hook(f'blocks.{i}.attn.kda.g_proj.0.weight')))
+            hooks.append(kda.g_proj[1].register_forward_hook(
+                make_linear_hook(f'blocks.{i}.attn.kda.g_proj.1.weight')))
+            hooks.append(kda.o_proj.register_forward_hook(
+                make_linear_hook(f'blocks.{i}.attn.kda.o_proj.weight')))
         else:
             hooks.append(block.attn.register_forward_hook(make_attn_hook(i)))
         hooks.append(block.mlp.register_forward_hook(make_mlp_hook(i)))
@@ -1263,7 +1448,7 @@ def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
     for hook in hooks:
         hook.remove()
     for i, block in enumerate(model.blocks):
-        if not isinstance(block, Mamba2Block):
+        if not isinstance(block, (Mamba2Block, KDABlock)):
             block.attn._calib = False
         block.mlp._calib = False
     for name in hessians:

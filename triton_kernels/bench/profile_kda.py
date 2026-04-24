@@ -15,10 +15,13 @@ from __future__ import annotations
 
 import os
 import sys
+import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+from triton_kernels.conv1d import causal_conv1d_autograd
 from triton_kernels.kda import kda_triton_autograd
 from triton_kernels.bench._common import (
     RMSNorm, MLP, time_fwd_bwd, run_profiler_trace,
@@ -26,33 +29,57 @@ from triton_kernels.bench._common import (
 
 
 class KDALayer(nn.Module):
-    """Project x → q, k, v, g, beta; run kda_triton_autograd; project back."""
+    """FLA-shaped training KDA mixer around kda_triton_autograd."""
 
     def __init__(self, dim: int, num_heads: int, k_dim: int, v_dim: int):
         super().__init__()
         self.num_heads = num_heads
         self.k_dim = k_dim
         self.v_dim = v_dim
-        qkv_out = num_heads * (2 * k_dim + v_dim)  # q, k, v
-        gate_out = num_heads * k_dim               # g (per-key decay, log-space)
-        beta_out = num_heads                        # beta (scalar per head)
-        self.in_proj = nn.Linear(dim, qkv_out + gate_out + beta_out, bias=False)
+        H, K, V = num_heads, k_dim, v_dim
+        self.q_proj = nn.Linear(dim, H * K, bias=False)
+        self.k_proj = nn.Linear(dim, H * K, bias=False)
+        self.v_proj = nn.Linear(dim, H * V, bias=False)
+        self.f_proj = nn.Sequential(
+            nn.Linear(dim, V, bias=False),
+            nn.Linear(V, H * K, bias=False),
+        )
+        self.b_proj = nn.Linear(dim, H, bias=False)
+        self.g_proj = nn.Sequential(
+            nn.Linear(dim, V, bias=False),
+            nn.Linear(V, H * V, bias=True),
+        )
+        self.o_norm_weight = nn.Parameter(torch.ones(V, dtype=torch.float32))
         self.out_proj = nn.Linear(num_heads * v_dim, dim, bias=False)
+        self.A_log = nn.Parameter(torch.empty(H, dtype=torch.float32).uniform_(1.0, 16.0).log())
+        dt = torch.exp(
+            torch.rand(H * K, dtype=torch.float32) * (math.log(0.1) - math.log(0.001))
+            + math.log(0.001)
+        ).clamp(min=1e-4)
+        self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))
+        self.q_conv_w = nn.Parameter(torch.randn(H, K, 4) * 0.1)
+        self.k_conv_w = nn.Parameter(torch.randn(H, K, 4) * 0.1)
+        self.v_conv_w = nn.Parameter(torch.randn(H, V, 4) * 0.1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
         H, K, V = self.num_heads, self.k_dim, self.v_dim
-        proj = self.in_proj(x)
-        ofs = 0
-        q = proj[..., ofs:ofs + H * K].reshape(B, T, H, K); ofs += H * K
-        k = proj[..., ofs:ofs + H * K].reshape(B, T, H, K); ofs += H * K
-        v = proj[..., ofs:ofs + H * V].reshape(B, T, H, V); ofs += H * V
-        g_raw = proj[..., ofs:ofs + H * K].reshape(B, T, H, K); ofs += H * K
-        beta_raw = proj[..., ofs:]
-        # g < 0 everywhere (decay), small magnitude.
-        g = -0.1 * torch.nn.functional.softplus(g_raw.float())
-        beta = torch.sigmoid(beta_raw.float())
+        q = self.q_proj(x).reshape(B, T, H, K)
+        k = self.k_proj(x).reshape(B, T, H, K)
+        v = self.v_proj(x).reshape(B, T, H, V)
+        q = F.silu(causal_conv1d_autograd(q, self.q_conv_w))
+        k = F.silu(causal_conv1d_autograd(k, self.k_conv_w))
+        v = F.silu(causal_conv1d_autograd(v, self.v_conv_w))
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        g_raw = self.f_proj(x).reshape(B, T, H, K)
+        g = -torch.exp(self.A_log.float())[None, None, :, None] * F.softplus(
+            g_raw.float() + self.dt_bias.reshape(H, K)
+        )
+        beta = torch.sigmoid(self.b_proj(x).float())
         y = kda_triton_autograd(q, k, v, g, beta)
+        gate = self.g_proj(x).reshape(B, T, H, V)
+        y = F.rms_norm(y, (V,), self.o_norm_weight.to(dtype=y.dtype)) * torch.sigmoid(gate)
         return self.out_proj(y.to(x.dtype).reshape(B, T, H * V))
 
 
