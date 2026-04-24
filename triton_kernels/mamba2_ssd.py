@@ -56,15 +56,15 @@ def _mamba2_chunk_fwd(
         log_a = tl.maximum(A_h * dt_c, -20.0)
         cum = tl.cumsum(log_a, axis=0)
 
-        Cs = tl.dot(C_c, state)
+        Cs = tl.dot(C_c, state, input_precision="tf32")
         y_state = Cs * tl.exp(cum)[:, None]
 
-        qk = tl.dot(C_c, tl.trans(B_c))
+        qk = tl.dot(C_c, tl.trans(B_c), input_precision="tf32")
         decay_diff = cum[:, None] - cum[None, :]
         causal = c_offs[:, None] >= c_offs[None, :]
         decay_diff = tl.where(causal, decay_diff, -float('inf'))
         attn = qk * tl.exp(decay_diff)
-        y_intra = tl.dot(attn, x_c)
+        y_intra = tl.dot(attn, x_c, input_precision="tf32")
 
         y_chunk = y_state + y_intra
         y_ptrs = Y + b * s_yb + (t0 + c_offs[:, None]) * s_yt + h * s_yh + d_offs[None, :] * s_yd
@@ -72,7 +72,9 @@ def _mamba2_chunk_fwd(
 
         total_log = tl.sum(log_a, axis=0)
         decay_to_end = tl.exp(total_log - cum)
-        state = state * tl.exp(total_log) + tl.dot(tl.trans(B_c), x_c * decay_to_end[:, None])
+        state = state * tl.exp(total_log) + tl.dot(
+            tl.trans(B_c), x_c * decay_to_end[:, None], input_precision="tf32",
+        )
 
     st_ptrs = STATES + b * s_sb + h * s_sh + num_chunks * s_sc + n_offs[:, None] * s_sn + d_offs[None, :] * s_sd
     tl.store(st_ptrs, state)
@@ -133,23 +135,23 @@ def _mamba2_chunk_bwd(
         exp_cum = tl.exp(cum)
         decay_to_end = tl.exp(total_log - cum)
 
-        qk = tl.dot(C_c, tl.trans(B_c))
+        qk = tl.dot(C_c, tl.trans(B_c), input_precision="tf32")
         decay_diff = cum[:, None] - cum[None, :]
         causal = c_offs[:, None] >= c_offs[None, :]
         decay_diff = tl.where(causal, decay_diff, -float('inf'))
         decay = tl.exp(decay_diff)
         attn = qk * decay
 
-        Cs = tl.dot(C_c, state)
+        Cs = tl.dot(C_c, state, input_precision="tf32")
 
         dCs = dy * exp_cum[:, None]
-        dC_chunk = tl.dot(dCs, tl.trans(state))
-        d_state_read = tl.dot(tl.trans(C_c), dCs)
+        dC_chunk = tl.dot(dCs, tl.trans(state), input_precision="tf32")
+        d_state_read = tl.dot(tl.trans(C_c), dCs, input_precision="tf32")
 
         d_cum = tl.sum(dy * Cs * exp_cum[:, None], axis=1)
 
-        dx_chunk = tl.dot(tl.trans(attn), dy)
-        dattn = tl.dot(dy, tl.trans(x_c))
+        dx_chunk = tl.dot(tl.trans(attn), dy, input_precision="tf32")
+        dattn = tl.dot(dy, tl.trans(x_c), input_precision="tf32")
 
         dqk = dattn * decay
 
@@ -157,15 +159,15 @@ def _mamba2_chunk_bwd(
         d_cum = d_cum + tl.sum(d_decay * decay, axis=1)
         d_cum = d_cum - tl.sum(d_decay * decay, axis=0)
 
-        dC_chunk = dC_chunk + tl.dot(dqk, B_c)
-        dB_chunk = tl.dot(tl.trans(dqk), C_c)
+        dC_chunk = dC_chunk + tl.dot(dqk, B_c, input_precision="tf32")
+        dB_chunk = tl.dot(tl.trans(dqk), C_c, input_precision="tf32")
 
         weighted_x = x_c * decay_to_end[:, None]
 
-        d_wx = tl.dot(B_c, d_state)
+        d_wx = tl.dot(B_c, d_state, input_precision="tf32")
         dx_chunk = dx_chunk + d_wx * decay_to_end[:, None]
 
-        dB_state = tl.dot(weighted_x, tl.trans(d_state))
+        dB_state = tl.dot(weighted_x, tl.trans(d_state), input_precision="tf32")
         dB_chunk = dB_chunk + dB_state
 
         d_dte = tl.sum(d_wx * x_c, axis=1)
@@ -206,10 +208,11 @@ def _mamba2_chunk_bwd(
 def _mamba2t_chunk_fwd(
     x: Tensor, A_log: Tensor, B: Tensor, C: Tensor, dt: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    x = x.contiguous(); B = B.contiguous(); C = C.contiguous(); dt = dt.contiguous()
     Bsz, T, H, P = x.shape
     N = B.shape[-1]
     CS = 64
+    if T % CS != 0:
+        raise ValueError("mamba2 SSD kernel requires sequence length divisible by 64")
     NC = T // CS
     y = x.new_empty(x.shape)
     states = torch.empty(Bsz, H, NC + 1, N, P, device=x.device, dtype=torch.float32)
@@ -237,10 +240,11 @@ def _mamba2t_chunk_bwd(
     dy: Tensor, x: Tensor, A_log: Tensor, B: Tensor, C: Tensor,
     dt: Tensor, states: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    x = x.contiguous(); B = B.contiguous(); C = C.contiguous(); dt = dt.contiguous(); dy = dy.contiguous()
     Bsz, T, H, P = x.shape
     N = B.shape[-1]
     CS = 64
+    if T % CS != 0:
+        raise ValueError("mamba2 SSD backward requires sequence length divisible by 64")
     NC = T // CS
     dx = x.new_empty(x.shape)
     dB = B.new_empty(B.shape)
@@ -273,7 +277,7 @@ def _mamba2t_chunk_bwd_fake(dy, x, A_log, B, C, dt, states):
 def _mamba2t_autograd_bwd(ctx, do, d_states):
     x, A_log, B, C, dt, states = ctx.saved_tensors
     dx, dA_log, dB, dC, ddt = torch.ops.mamba2t.chunk_bwd(
-        do.contiguous(), x, A_log, B, C, dt, states,
+        do, x, A_log, B, C, dt, states,
     )
     return dx, dA_log, dB, dC, ddt
 

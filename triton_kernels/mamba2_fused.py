@@ -33,8 +33,8 @@ def _mamba2_fused_fwd(
     X, B_IN, C_IN, DT, A_LOG,
     # Conv weights: [H, D, 4] layout, contiguous
     CONV_WX, CONV_WB, CONV_WC,
-    # Outputs: main (Y, STATES) + saved post-conv pre-silu activations
-    Y, STATES, CONV_X_OUT, CONV_B_OUT, CONV_C_OUT,
+    # Outputs
+    Y, STATES,
     # X strides [B, T, H, P]
     s_xb, s_xt, s_xh, s_xd,
     # B strides [B, T, H, N]
@@ -103,7 +103,6 @@ def _mamba2_fused_fwd(
         x_m3 = tl.load(x_ptrs_base + (t_abs[:, None] - 3) * s_xt + d_offs[None, :] * s_xd,
                         mask=(t_abs[:, None] - 3) >= 0, other=0.0).to(tl.float32)
         conv_x = wx0[None, :] * x_raw + wx1[None, :] * x_m1 + wx2[None, :] * x_m2 + wx3[None, :] * x_m3
-        tl.store(CONV_X_OUT + b * s_xb + t_abs[:, None] * s_xt + h * s_xh + d_offs[None, :] * s_xd, conv_x)
         x_c = conv_x * tl.sigmoid(conv_x)  # SiLU
 
         # ── Conv1d on B ──
@@ -116,7 +115,6 @@ def _mamba2_fused_fwd(
         b_m3 = tl.load(b_ptrs_base + (t_abs[:, None] - 3) * s_bt + n_offs[None, :] * s_bn,
                         mask=(t_abs[:, None] - 3) >= 0, other=0.0).to(tl.float32)
         conv_b = wb0[None, :] * b_raw + wb1[None, :] * b_m1 + wb2[None, :] * b_m2 + wb3[None, :] * b_m3
-        tl.store(CONV_B_OUT + b * s_bb + t_abs[:, None] * s_bt + h * s_bh + n_offs[None, :] * s_bn, conv_b)
         B_c = conv_b * tl.sigmoid(conv_b)
 
         # ── Conv1d on C ──
@@ -129,7 +127,6 @@ def _mamba2_fused_fwd(
         c_m3 = tl.load(c_ptrs_base + (t_abs[:, None] - 3) * s_ct + n_offs[None, :] * s_cn,
                         mask=(t_abs[:, None] - 3) >= 0, other=0.0).to(tl.float32)
         conv_c = wc0[None, :] * c_raw + wc1[None, :] * c_m1 + wc2[None, :] * c_m2 + wc3[None, :] * c_m3
-        tl.store(CONV_C_OUT + b * s_cb + t_abs[:, None] * s_ct + h * s_ch + n_offs[None, :] * s_cn, conv_c)
         C_c = conv_c * tl.sigmoid(conv_c)
 
         # ── DT (no conv) ──
@@ -139,15 +136,15 @@ def _mamba2_fused_fwd(
         log_a = tl.maximum(A_h * dt_c, -20.0)
         cum = tl.cumsum(log_a, axis=0)
 
-        Cs = tl.dot(C_c, state)
+        Cs = tl.dot(C_c, state, input_precision="tf32")
         y_state = Cs * tl.exp(cum)[:, None]
 
-        qk = tl.dot(C_c, tl.trans(B_c))
+        qk = tl.dot(C_c, tl.trans(B_c), input_precision="tf32")
         decay_diff = cum[:, None] - cum[None, :]
         causal = c_offs[:, None] >= c_offs[None, :]
         decay_diff = tl.where(causal, decay_diff, -float('inf'))
         attn = qk * tl.exp(decay_diff)
-        y_intra = tl.dot(attn, x_c)
+        y_intra = tl.dot(attn, x_c, input_precision="tf32")
 
         y_chunk = y_state + y_intra
         y_ptrs = Y + b * s_yb + (t0 + c_offs[:, None]) * s_yt + h * s_yh + d_offs[None, :] * s_yd
@@ -155,7 +152,9 @@ def _mamba2_fused_fwd(
 
         total_log = tl.sum(log_a, axis=0)
         decay_to_end = tl.exp(total_log - cum)
-        state = state * tl.exp(total_log) + tl.dot(tl.trans(B_c), x_c * decay_to_end[:, None])
+        state = state * tl.exp(total_log) + tl.dot(
+            tl.trans(B_c), x_c * decay_to_end[:, None], input_precision="tf32",
+        )
 
     # Save final state
     st_ptrs = STATES + b * s_sb + h * s_sh + num_chunks * s_sc + n_offs[:, None] * s_sn + d_offs[None, :] * s_sd
@@ -175,14 +174,12 @@ def _mamba2_fused_fwd(
 def _mamba2_fused_bwd(
     # Raw inputs (still needed for conv_bwd elsewhere; strides reused for CONV_* too)
     X, B_IN, C_IN, DT, A_LOG,
-    # Conv weights (kept for signature symmetry, unused now since we read saved conv)
+    # Conv weights
     CONV_WX, CONV_WB, CONV_WC,
     # Saved states
     STATES,
     # Gradient of output
     DY,
-    # Saved pre-SiLU conv outputs from forward
-    CONV_X, CONV_B, CONV_C,
     # Output: gradients w.r.t. conv outputs (before conv transpose)
     D_CONV_X, D_CONV_B, D_CONV_C,
     # Output: gradient w.r.t. dt
@@ -199,6 +196,10 @@ def _mamba2_fused_bwd(
     s_sb, s_sh, s_sc, s_sn, s_sd,
     # DY strides [B, T, H, P]
     s_dyb, s_dyt, s_dyh, s_dyd,
+    # D_CONV_X/B/C strides
+    s_dcxb, s_dcxt, s_dcxh, s_dcxd,
+    s_dcbb, s_dcbt, s_dcbh, s_dcbn,
+    s_dccb, s_dcct, s_dcch, s_dccn,
     # DDT strides [B, T, H]
     s_ddb, s_ddt_, s_ddh,
     nheads, num_chunks, seqlen,
@@ -218,23 +219,83 @@ def _mamba2_fused_bwd(
 
     d_state = tl.zeros((SDIM, HDIM), dtype=tl.float32)
 
+    cwx_base = h * HDIM * 4
+    wx0 = tl.load(CONV_WX + cwx_base + d_offs * 4 + 0).to(tl.float32)
+    wx1 = tl.load(CONV_WX + cwx_base + d_offs * 4 + 1).to(tl.float32)
+    wx2 = tl.load(CONV_WX + cwx_base + d_offs * 4 + 2).to(tl.float32)
+    wx3 = tl.load(CONV_WX + cwx_base + d_offs * 4 + 3).to(tl.float32)
+
+    cwb_base = h * SDIM * 4
+    wb0 = tl.load(CONV_WB + cwb_base + n_offs * 4 + 0).to(tl.float32)
+    wb1 = tl.load(CONV_WB + cwb_base + n_offs * 4 + 1).to(tl.float32)
+    wb2 = tl.load(CONV_WB + cwb_base + n_offs * 4 + 2).to(tl.float32)
+    wb3 = tl.load(CONV_WB + cwb_base + n_offs * 4 + 3).to(tl.float32)
+
+    cwc_base = h * SDIM * 4
+    wc0 = tl.load(CONV_WC + cwc_base + n_offs * 4 + 0).to(tl.float32)
+    wc1 = tl.load(CONV_WC + cwc_base + n_offs * 4 + 1).to(tl.float32)
+    wc2 = tl.load(CONV_WC + cwc_base + n_offs * 4 + 2).to(tl.float32)
+    wc3 = tl.load(CONV_WC + cwc_base + n_offs * 4 + 3).to(tl.float32)
+
     for ci_rev in range(num_chunks):
         ci = num_chunks - 1 - ci_rev
         t0 = ci * CHUNK
         t_abs = t0 + c_offs
 
         # ══════════════════════════════════════════════════════════════
-        # Step 1: Load saved pre-SiLU conv outputs, recompute only SiLU (cheap)
+        # Step 1: Recompute pre-SiLU conv outputs and SiLU.
         # ══════════════════════════════════════════════════════════════
-        conv_x = tl.load(CONV_X + b * s_xb + t_abs[:, None] * s_xt + h * s_xh + d_offs[None, :] * s_xd)
+        x_ptrs_base = X + b * s_xb + h * s_xh
+        x_raw = tl.load(x_ptrs_base + t_abs[:, None] * s_xt + d_offs[None, :] * s_xd).to(tl.float32)
+        x_m1 = tl.load(
+            x_ptrs_base + (t_abs[:, None] - 1) * s_xt + d_offs[None, :] * s_xd,
+            mask=(t_abs[:, None] - 1) >= 0, other=0.0,
+        ).to(tl.float32)
+        x_m2 = tl.load(
+            x_ptrs_base + (t_abs[:, None] - 2) * s_xt + d_offs[None, :] * s_xd,
+            mask=(t_abs[:, None] - 2) >= 0, other=0.0,
+        ).to(tl.float32)
+        x_m3 = tl.load(
+            x_ptrs_base + (t_abs[:, None] - 3) * s_xt + d_offs[None, :] * s_xd,
+            mask=(t_abs[:, None] - 3) >= 0, other=0.0,
+        ).to(tl.float32)
+        conv_x = wx0[None, :] * x_raw + wx1[None, :] * x_m1 + wx2[None, :] * x_m2 + wx3[None, :] * x_m3
         sig_x = tl.sigmoid(conv_x)
         x_c = conv_x * sig_x
 
-        conv_b = tl.load(CONV_B + b * s_bb + t_abs[:, None] * s_bt + h * s_bh + n_offs[None, :] * s_bn)
+        b_ptrs_base = B_IN + b * s_bb + h * s_bh
+        b_raw = tl.load(b_ptrs_base + t_abs[:, None] * s_bt + n_offs[None, :] * s_bn).to(tl.float32)
+        b_m1 = tl.load(
+            b_ptrs_base + (t_abs[:, None] - 1) * s_bt + n_offs[None, :] * s_bn,
+            mask=(t_abs[:, None] - 1) >= 0, other=0.0,
+        ).to(tl.float32)
+        b_m2 = tl.load(
+            b_ptrs_base + (t_abs[:, None] - 2) * s_bt + n_offs[None, :] * s_bn,
+            mask=(t_abs[:, None] - 2) >= 0, other=0.0,
+        ).to(tl.float32)
+        b_m3 = tl.load(
+            b_ptrs_base + (t_abs[:, None] - 3) * s_bt + n_offs[None, :] * s_bn,
+            mask=(t_abs[:, None] - 3) >= 0, other=0.0,
+        ).to(tl.float32)
+        conv_b = wb0[None, :] * b_raw + wb1[None, :] * b_m1 + wb2[None, :] * b_m2 + wb3[None, :] * b_m3
         sig_b = tl.sigmoid(conv_b)
         B_c = conv_b * sig_b
 
-        conv_c = tl.load(CONV_C + b * s_cb + t_abs[:, None] * s_ct + h * s_ch + n_offs[None, :] * s_cn)
+        c_ptrs_base = C_IN + b * s_cb + h * s_ch
+        c_raw = tl.load(c_ptrs_base + t_abs[:, None] * s_ct + n_offs[None, :] * s_cn).to(tl.float32)
+        c_m1 = tl.load(
+            c_ptrs_base + (t_abs[:, None] - 1) * s_ct + n_offs[None, :] * s_cn,
+            mask=(t_abs[:, None] - 1) >= 0, other=0.0,
+        ).to(tl.float32)
+        c_m2 = tl.load(
+            c_ptrs_base + (t_abs[:, None] - 2) * s_ct + n_offs[None, :] * s_cn,
+            mask=(t_abs[:, None] - 2) >= 0, other=0.0,
+        ).to(tl.float32)
+        c_m3 = tl.load(
+            c_ptrs_base + (t_abs[:, None] - 3) * s_ct + n_offs[None, :] * s_cn,
+            mask=(t_abs[:, None] - 3) >= 0, other=0.0,
+        ).to(tl.float32)
+        conv_c = wc0[None, :] * c_raw + wc1[None, :] * c_m1 + wc2[None, :] * c_m2 + wc3[None, :] * c_m3
         sig_c = tl.sigmoid(conv_c)
         C_c = conv_c * sig_c
 
@@ -254,24 +315,24 @@ def _mamba2_fused_bwd(
         exp_cum = tl.exp(cum)
         decay_to_end = tl.exp(total_log - cum)
 
-        qk = tl.dot(C_c, tl.trans(B_c))
+        qk = tl.dot(C_c, tl.trans(B_c), input_precision="tf32")
         decay_diff = cum[:, None] - cum[None, :]
         causal = c_offs[:, None] >= c_offs[None, :]
         decay_diff = tl.where(causal, decay_diff, -float('inf'))
         decay = tl.exp(decay_diff)
         attn = qk * decay
 
-        Cs = tl.dot(C_c, state)
+        Cs = tl.dot(C_c, state, input_precision="tf32")
 
         # d w.r.t. post-SiLU values (dx_ssm, dB_ssm, dC_ssm)
         dCs = dy * exp_cum[:, None]
-        dC_ssm = tl.dot(dCs, tl.trans(state))
-        d_state_read = tl.dot(tl.trans(C_c), dCs)
+        dC_ssm = tl.dot(dCs, tl.trans(state), input_precision="tf32")
+        d_state_read = tl.dot(tl.trans(C_c), dCs, input_precision="tf32")
 
         d_cum = tl.sum(dy * Cs * exp_cum[:, None], axis=1)
 
-        dx_ssm = tl.dot(tl.trans(attn), dy)
-        dattn = tl.dot(dy, tl.trans(x_c))
+        dx_ssm = tl.dot(tl.trans(attn), dy, input_precision="tf32")
+        dattn = tl.dot(dy, tl.trans(x_c), input_precision="tf32")
 
         dqk = dattn * decay
 
@@ -279,15 +340,15 @@ def _mamba2_fused_bwd(
         d_cum = d_cum + tl.sum(d_decay * decay, axis=1)
         d_cum = d_cum - tl.sum(d_decay * decay, axis=0)
 
-        dC_ssm = dC_ssm + tl.dot(dqk, B_c)
-        dB_ssm = tl.dot(tl.trans(dqk), C_c)
+        dC_ssm = dC_ssm + tl.dot(dqk, B_c, input_precision="tf32")
+        dB_ssm = tl.dot(tl.trans(dqk), C_c, input_precision="tf32")
 
         weighted_x = x_c * decay_to_end[:, None]
 
-        d_wx = tl.dot(B_c, d_state)
+        d_wx = tl.dot(B_c, d_state, input_precision="tf32")
         dx_ssm = dx_ssm + d_wx * decay_to_end[:, None]
 
-        dB_state = tl.dot(weighted_x, tl.trans(d_state))
+        dB_state = tl.dot(weighted_x, tl.trans(d_state), input_precision="tf32")
         dB_ssm = dB_ssm + dB_state
 
         d_dte = tl.sum(d_wx * x_c, axis=1)
@@ -319,10 +380,10 @@ def _mamba2_fused_bwd(
         d_conv_b = dB_ssm * (sig_b * (1.0 + conv_b * (1.0 - sig_b)))
         d_conv_c = dC_ssm * (sig_c * (1.0 + conv_c * (1.0 - sig_c)))
 
-        # Store d_conv outputs (reusing input strides since same shape)
-        tl.store(D_CONV_X + b * s_xb + t_abs[:, None] * s_xt + h * s_xh + d_offs[None, :] * s_xd, d_conv_x)
-        tl.store(D_CONV_B + b * s_bb + t_abs[:, None] * s_bt + h * s_bh + n_offs[None, :] * s_bn, d_conv_b)
-        tl.store(D_CONV_C + b * s_cb + t_abs[:, None] * s_ct + h * s_ch + n_offs[None, :] * s_cn, d_conv_c)
+        # Store compact d_conv outputs for the depthwise conv transpose kernels.
+        tl.store(D_CONV_X + b * s_dcxb + t_abs[:, None] * s_dcxt + h * s_dcxh + d_offs[None, :] * s_dcxd, d_conv_x)
+        tl.store(D_CONV_B + b * s_dcbb + t_abs[:, None] * s_dcbt + h * s_dcbh + n_offs[None, :] * s_dcbn, d_conv_b)
+        tl.store(D_CONV_C + b * s_dccb + t_abs[:, None] * s_dcct + h * s_dcch + n_offs[None, :] * s_dccn, d_conv_c)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -333,32 +394,31 @@ def _mamba2_fused_bwd(
 def _mamba2t_fused_fwd(
     x: Tensor, A_log: Tensor, B: Tensor, C: Tensor, dt: Tensor,
     conv_w_x: Tensor, conv_w_b: Tensor, conv_w_c: Tensor,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Fused conv+SiLU+SSD forward. Returns (y, states, conv_x, conv_b, conv_c).
-    conv_x/b/c are the pre-SiLU post-conv activations, saved for use in backward
-    to avoid re-running the conv recomputation.
+) -> tuple[Tensor, Tensor]:
+    """Fused conv+SiLU+SSD forward. Returns (y, states).
+
+    Backward recomputes the cheap width-4 convolutions instead of saving three
+    fp32 full-sequence pre-SiLU activation tensors.
     """
-    x = x.contiguous(); B = B.contiguous(); C = C.contiguous(); dt = dt.contiguous()
     Bsz, T, H, P = x.shape
     N = B.shape[-1]
     CS = 64
+    if T % CS != 0:
+        raise ValueError("mamba2 fused kernel requires sequence length divisible by 64")
     NC = T // CS
     y = x.new_empty(x.shape)
     states = torch.empty(Bsz, H, NC + 1, N, P, device=x.device, dtype=torch.float32)
-    conv_x_save = torch.empty_like(x, dtype=torch.float32)
-    conv_b_save = torch.empty_like(B, dtype=torch.float32)
-    conv_c_save = torch.empty_like(C, dtype=torch.float32)
     grid = (Bsz * H,)
     _mamba2_fused_fwd[grid](
         x, B, C, dt, A_log,
         conv_w_x, conv_w_b, conv_w_c,
-        y, states, conv_x_save, conv_b_save, conv_c_save,
+        y, states,
         *x.stride(), *B.stride(), *C.stride(), *dt.stride(),
         *y.stride(), *states.stride(),
         H, NC, T,
         CHUNK=CS, HDIM=P, SDIM=N,
     )
-    return y, states, conv_x_save, conv_b_save, conv_c_save
+    return y, states
 
 
 @torch.library.register_fake("mamba2t::fused_fwd")
@@ -368,10 +428,7 @@ def _mamba2t_fused_fwd_fake(x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_c):
     NC = T // 64
     y = x.new_empty(Bsz, T, H, P)
     states = torch.empty(Bsz, H, NC + 1, N, P, device=x.device, dtype=torch.float32)
-    conv_x_save = torch.empty_like(x, dtype=torch.float32)
-    conv_b_save = torch.empty_like(B, dtype=torch.float32)
-    conv_c_save = torch.empty_like(C, dtype=torch.float32)
-    return y, states, conv_x_save, conv_b_save, conv_c_save
+    return y, states
 
 
 @torch.library.custom_op("mamba2t::fused_bwd", mutates_args=())
@@ -379,22 +436,18 @@ def _mamba2t_fused_bwd(
     dy: Tensor, x: Tensor, A_log: Tensor, B: Tensor, C: Tensor,
     dt: Tensor, states: Tensor,
     conv_w_x: Tensor, conv_w_b: Tensor, conv_w_c: Tensor,
-    conv_x_save: Tensor, conv_b_save: Tensor, conv_c_save: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Fused backward. Returns (dx, dA_log, dB, dC, ddt, d_conv_w_x, d_conv_w_b, d_conv_w_c)."""
-    x = x.contiguous(); B = B.contiguous(); C = C.contiguous()
-    dt = dt.contiguous(); dy = dy.contiguous()
-    conv_x_save = conv_x_save.contiguous()
-    conv_b_save = conv_b_save.contiguous()
-    conv_c_save = conv_c_save.contiguous()
     Bsz, T, H, P = x.shape
     N = B.shape[-1]
     CS = 64
+    if T % CS != 0:
+        raise ValueError("mamba2 fused backward requires sequence length divisible by 64")
     NC = T // CS
 
-    d_conv_x = torch.empty_like(x)
-    d_conv_b = torch.empty_like(B)
-    d_conv_c = torch.empty_like(C)
+    d_conv_x = torch.empty(x.shape, device=x.device, dtype=x.dtype)
+    d_conv_b = torch.empty(B.shape, device=B.device, dtype=B.dtype)
+    d_conv_c = torch.empty(C.shape, device=C.device, dtype=C.dtype)
     ddt = dt.new_empty(dt.shape)
 
     grid = (Bsz * H,)
@@ -402,10 +455,11 @@ def _mamba2t_fused_bwd(
         x, B, C, dt, A_log,
         conv_w_x, conv_w_b, conv_w_c,
         states, dy,
-        conv_x_save, conv_b_save, conv_c_save,
         d_conv_x, d_conv_b, d_conv_c, ddt,
         *x.stride(), *B.stride(), *C.stride(), *dt.stride(),
-        *states.stride(), *dy.stride(), *ddt.stride(),
+        *states.stride(), *dy.stride(),
+        *d_conv_x.stride(), *d_conv_b.stride(), *d_conv_c.stride(),
+        *ddt.stride(),
         H, NC, T,
         CHUNK=CS, HDIM=P, SDIM=N,
     )
@@ -419,8 +473,7 @@ def _mamba2t_fused_bwd(
 
 
 @torch.library.register_fake("mamba2t::fused_bwd")
-def _mamba2t_fused_bwd_fake(dy, x, A_log, B, C, dt, states, conv_w_x, conv_w_b, conv_w_c,
-                             conv_x_save, conv_b_save, conv_c_save):
+def _mamba2t_fused_bwd_fake(dy, x, A_log, B, C, dt, states, conv_w_x, conv_w_b, conv_w_c):
     return (
         x.new_empty(x.shape),
         A_log.new_empty(A_log.shape),
@@ -433,21 +486,19 @@ def _mamba2t_fused_bwd_fake(dy, x, A_log, B, C, dt, states, conv_w_x, conv_w_b, 
     )
 
 
-def _fused_autograd_bwd(ctx, do, d_states, d_cx, d_cb, d_cc):
-    x, A_log, B, C, dt, states, conv_w_x, conv_w_b, conv_w_c, conv_x_save, conv_b_save, conv_c_save = ctx.saved_tensors
+def _fused_autograd_bwd(ctx, do, d_states):
+    x, A_log, B, C, dt, states, conv_w_x, conv_w_b, conv_w_c = ctx.saved_tensors
     dx, dA_log, dB, dC, ddt, d_cwx, d_cwb, d_cwc = torch.ops.mamba2t.fused_bwd(
-        do.contiguous(), x, A_log, B, C, dt, states,
+        do, x, A_log, B, C, dt, states,
         conv_w_x, conv_w_b, conv_w_c,
-        conv_x_save, conv_b_save, conv_c_save,
     )
     return dx, dA_log, dB, dC, ddt, d_cwx, d_cwb, d_cwc
 
 
 def _fused_autograd_setup(ctx, inputs, output):
     x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_c = inputs
-    y, states, conv_x_save, conv_b_save, conv_c_save = output
-    ctx.save_for_backward(x, A_log, B, C, dt, states, conv_w_x, conv_w_b, conv_w_c,
-                          conv_x_save, conv_b_save, conv_c_save)
+    y, states = output
+    ctx.save_for_backward(x, A_log, B, C, dt, states, conv_w_x, conv_w_b, conv_w_c)
 
 
 torch.library.register_autograd(
@@ -474,6 +525,6 @@ def mamba2_fused_triton_autograd(x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_
     Returns:
         y: [B, T, H, P] output
     """
-    assert chunk_size in (64, 128), "Only chunk_size 64 or 128 supported"
-    y, _states, _cx, _cb, _cc = torch.ops.mamba2t.fused_fwd(x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_c)
+    assert chunk_size == 64, "Only chunk_size=64 supported"
+    y, _states = torch.ops.mamba2t.fused_fwd(x, A_log, B, C, dt, conv_w_x, conv_w_b, conv_w_c)
     return y

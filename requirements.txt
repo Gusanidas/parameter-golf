@@ -1,6 +1,7 @@
 numpy
 tqdm
 torch
+fla-core==0.4.2
 huggingface-hub
 kernels
 setuptools
