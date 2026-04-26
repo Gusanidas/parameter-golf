@@ -27,6 +27,14 @@ from .conv1d import causal_conv1d_triton_bwd
 # Fused Forward: Conv1d + SiLU + Mamba2 SSD
 # ═══════════════════════════════════════════════════════════════════════════
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_stages=1, num_warps=4),
+        triton.Config({}, num_stages=1, num_warps=8),
+        triton.Config({}, num_stages=2, num_warps=4),
+    ],
+    key=["CHUNK", "HDIM", "SDIM"],
+)
 @triton.jit
 def _mamba2_fused_fwd(
     # Raw inputs (pre-conv)
@@ -180,8 +188,11 @@ def _mamba2_fused_fwd(
     configs=[
         # num_stages=1 avoids the multi-stage SMEM doubling that pushes us over
         # the 232,448 B Blackwell cap. The kernel's per-chunk loop body is
-        # arithmetic-heavy and gains little from pipelining anyway.
+        # arithmetic-heavy and gains little from pipelining anyway. num_warps
+        # in {4, 8}: 8 splits the [CHUNK, HDIM] tiles finer for the SSD-bwd
+        # matmuls; pick whichever measures faster.
         triton.Config({}, num_stages=1, num_warps=4),
+        triton.Config({}, num_stages=1, num_warps=8),
     ],
     key=["CHUNK", "HDIM", "SDIM"],
 )
