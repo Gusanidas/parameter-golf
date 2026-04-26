@@ -116,7 +116,8 @@ def run_conv(B=2, T=257, H=3, D=64, seed=0, dtype=torch.float32,
 
 
 def run_fused(B=2, T=64, H=2, P=32, N=16, seed=0, dtype=torch.float32,
-              compiled=False, atol=2e-2, rtol=2e-2) -> bool:
+              compiled=False, with_D_skip=False,
+              atol=2e-2, rtol=2e-2) -> bool:
     device = "cuda"
     gen = torch.Generator(device=device).manual_seed(seed + 1000)
     x, Bm, Cm, dt, A_log = _random_inputs(B, T, H, P, N, seed, device, dtype=dtype)
@@ -126,22 +127,27 @@ def run_fused(B=2, T=64, H=2, P=32, N=16, seed=0, dtype=torch.float32,
                       generator=gen) * 0.1).detach().requires_grad_()
     wc = (torch.randn(H, N, 4, device=device, dtype=dtype,
                       generator=gen) * 0.1).detach().requires_grad_()
+    D_skip = (torch.randn(H, device=device, dtype=torch.float32, generator=gen) * 0.5
+              if with_D_skip else None)
+    if D_skip is not None:
+        D_skip = D_skip.detach().requires_grad_()
 
     fn = mamba2_fused_triton_autograd
     if compiled:
         fn = torch.compile(fn, fullgraph=True)
-    y = fn(x, A_log, Bm, Cm, dt, wx, wb, wc)
+    y = fn(x, A_log, Bm, Cm, dt, wx, wb, wc, D_skip)
     dy = _random_like(y, seed + 20_000)
     y.backward(dy)
 
-    x2, Bm2, Cm2, dt2, A_log2, wx2, wb2, wc2 = (
-        t.detach().clone().requires_grad_()
-        for t in (x, Bm, Cm, dt, A_log, wx, wb, wc))
-    y_ref = mamba2_fused_ref(x2, A_log2, Bm2, Cm2, dt2, wx2, wb2, wc2)
+    refs = [t.detach().clone().requires_grad_() for t in (x, Bm, Cm, dt, A_log, wx, wb, wc)]
+    x2, Bm2, Cm2, dt2, A_log2, wx2, wb2, wc2 = refs
+    D_skip2 = D_skip.detach().clone().requires_grad_() if D_skip is not None else None
+    y_ref = mamba2_fused_ref(x2, A_log2, Bm2, Cm2, dt2, wx2, wb2, wc2, D_skip2)
     y_ref.backward(dy.float())
 
     mode = "compiled" if compiled else "eager"
-    print(f"[FUSED] {mode} dtype={dtype} B={B} T={T} H={H} P={P} N={N} seed={seed}")
+    skip_tag = " D_skip" if with_D_skip else ""
+    print(f"[FUSED]{skip_tag} {mode} dtype={dtype} B={B} T={T} H={H} P={P} N={N} seed={seed}")
     ok = True
     ok &= _check("y",      y,          y_ref,        atol, rtol)
     ok &= _check("dx",     x.grad,     x2.grad,      atol, rtol)
@@ -152,6 +158,8 @@ def run_fused(B=2, T=64, H=2, P=32, N=16, seed=0, dtype=torch.float32,
     ok &= _check("dconv_x", wx.grad,   wx2.grad,     atol, rtol)
     ok &= _check("dconv_b", wb.grad,   wb2.grad,     atol, rtol)
     ok &= _check("dconv_c", wc.grad,   wc2.grad,     atol, rtol)
+    if D_skip is not None:
+        ok &= _check("dD",     D_skip.grad, D_skip2.grad, atol, rtol)
     return ok
 
 
@@ -202,6 +210,9 @@ def main() -> int:
     all_ok &= run_fused(B=2, T=128, H=2, P=64, N=16, seed=1, compiled=True)
     all_ok &= run_fused(B=2, T=128, H=2, P=64, N=16, seed=2, dtype=torch.bfloat16,
                         atol=3e-2, rtol=3e-2)
+    all_ok &= run_fused(B=2, T=128, H=2, P=64, N=16, seed=3, with_D_skip=True)
+    all_ok &= run_fused(B=2, T=128, H=2, P=64, N=16, seed=4, with_D_skip=True,
+                        dtype=torch.bfloat16, atol=3e-2, rtol=3e-2)
     all_ok &= run_contract_checks()
     print("\n", "ALL PASS" if all_ok else "FAILURES", sep="")
     return 0 if all_ok else 1

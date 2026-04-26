@@ -5,8 +5,9 @@ End-to-end summary of the work done on the `pr1584_mamba` branch of
 benchmark, the optimizations landed so far, the latest numbers, and
 what's still open.
 
-Branch tip: `e2a5c41` (Cache fla.ops.kda function pointers in
-_require_fla). Working tree clean.
+Branch tip: pending commit (mamba2_fused: save pre-SiLU conv outputs in
+fwd to skip bwd recompute; conv1d shape guards; bf16 KDA test; nonzero
+D_skip+dD test).
 
 GPU: B200 (cuda:100). Container: `seq-modls.sqsh` (FA2 only — no FA3).
 DType: bf16 unless noted.
@@ -43,7 +44,7 @@ K=V=64 (kda), 2 layers, vocab=8192.
 
 ---
 
-## Latest numbers (post-`e2a5c41`, all bf16, B200)
+## Latest numbers (all bf16, B200)
 
 Constant ~32K tokens per step (B·T = 32768 for the larger shapes).
 
@@ -55,9 +56,13 @@ Constant ~32K tokens per step (B·T = 32768 for the larger shapes).
 | attn_full       | 5.99        | 7.20       | 9.46       |
 | mamba2_ssd      | 7.26        | 8.37       | 10.24      |
 | kda             | 9.31        | 9.47       | 9.98       |
-| mamba2_fused    | 8.84        | 11.67      | 17.30      |
+| mamba2_fused    | 8.93        | **10.90**  | **15.42**  |
 
-Source: jobs 361693 / 361694 / 361695.
+`mamba2_fused` rows now include the save-pre-SiLU optimization
+(jobs 361802 / 361803 / 361805). Other variants from jobs
+361693 / 361694 / 361695. The save-pre-SiLU win scales with
+`num_chunks`, so it's noise at T=2048 (32 chunks) and material at
+T=8192 (128 chunks).
 
 ### fwd+bwd, µs/token (constant 32K tokens)
 
@@ -67,7 +72,7 @@ Source: jobs 361693 / 361694 / 361695.
 | attn_full       | 0.183       | 0.220      | 0.289      |
 | mamba2_ssd      | 0.222       | 0.255      | 0.313      |
 | kda             | 0.284       | 0.289      | 0.305      |
-| mamba2_fused    | 0.270       | 0.356      | 0.528      |
+| mamba2_fused    | 0.272       | 0.333      | 0.471      |
 
 ### fwd / bwd split (ms)
 
@@ -77,7 +82,11 @@ Source: jobs 361693 / 361694 / 361695.
 | attn_full       | 2.79     | 3.20     | 3.16     | 4.04     | 3.81     | 5.65     |
 | mamba2_ssd      | 3.09     | 4.17     | 3.40     | 4.97     | 3.78     | 6.46     |
 | kda             | 3.90     | 5.41     | 3.94     | 5.53     | 4.13     | 5.85     |
-| mamba2_fused    | 3.35     | 5.49     | 4.13     | 7.55     | 5.66     | 11.64    |
+| mamba2_fused    | 3.72     | 5.21     | 4.70     | 6.20     | 6.55     | 8.87     |
+
+In `mamba2_fused` fwd grew slightly (extra 3 fp32 stores) but bwd
+dropped substantially (no longer recomputing 12 shifted loads + 12 FMAs
+per chunk). Net win is bigger at long T because bwd dominates there.
 
 ### Headlines from the seqlen sweep
 - **attn_window is flat in token-throughput** across all three lengths
@@ -90,10 +99,14 @@ Source: jobs 361693 / 361694 / 361695.
   (9.46 / 9.98 / 10.24) — the linear mixers have caught up to *full*
   attention but haven't pulled ahead. Window=512 attention stays
   ~2× cheaper at every length we measured.
-- **mamba2_fused, post-autotune, is no longer a 2–3× pessimization** —
-  but it's still slower than `mamba2_ssd` because its bwd recomputes
-  three width-4 convs per chunk. Fixing that is the highest remaining
-  Mamba2 lever.
+- **mamba2_fused, post-autotune + save-pre-SiLU, is closer to `ssd`
+  but not yet ahead.** At T=8192 B=4 it's now 15.42 ms vs ssd's 10.24 ms
+  (was 17.30 ms before saving conv outputs). The remaining gap is the
+  monolithic-kernel cost of doing all of (conv + SiLU + SSD) inside one
+  Triton kernel rather than letting the highly-parallel separate
+  `causal_conv1d` kernels run; the path forward for fused is either an
+  inter-chunk parallel scan or to admit the separate-kernel `ssd` path
+  is the right answer at these shapes.
 
 ---
 
@@ -121,6 +134,31 @@ Source: jobs 361693 / 361694 / 361695.
    Cache once; lazy-import semantics preserved. End-to-end impact at
    T=8192 B=4 was within the run-to-run noise (a few percent), so
    credit this as a code cleanup, not a measurable perf win.
+6. **mamba2_fused: save pre-SiLU conv outputs in fwd** (this PR).
+   The fwd kernel now writes the three pre-SiLU conv tensors (fp32) to
+   contiguous save buffers; the bwd loads them with a single fp32 read
+   instead of recomputing 4 shifted bf16 loads + 4 FMAs per branch per
+   chunk. Sigmoid/SiLU are still recomputed (one sigmoid per branch is
+   negligible). Sub-optimization: the save buffers are indexed via
+   derived contiguous strides rather than reusing the (possibly
+   non-contiguous) input strides — the training projections feed
+   non-contiguous `proj[..., :H*P].reshape(...)` slices, which would
+   otherwise OOB-walk the contig save buffer. T=4096 B=8: 11.67 → 10.90
+   (−7%). T=8192 B=4: 17.30 → 15.42 (−11%).
+7. **conv1d: explicit shape guards** (this PR). Previously a wrong
+   `w.shape[-1]`, mismatched dtype, or non-power-of-two `D` would fail
+   deep inside Triton with opaque codegen errors. Now caught at the
+   Python boundary with a clear message.
+8. **test_kda → bf16 by default** (this PR). The fp32 path triggers
+   FLA/Triton's `chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64`
+   PassManager error on B200; bf16 works on both H100 and B200 and
+   matches what training actually uses.
+9. **test_mamba2 fused: nonzero D_skip + dD coverage** (this PR).
+   Existing fused tests left `D_skip` defaulted to zeros, so the
+   `D[h] * x_c` skip path and its `atomic_add(DD_SKIP, …)` accumulator
+   were untested even though training enables them. Added eager-fp32
+   and eager-bf16 cases that compare against an extended
+   `mamba2_fused_ref(..., D_skip=…)`.
 
 ### Tried this round, did not land
 - **Triton-fuse `conv1d + SiLU`** (kept Inductor doing the SiLU
@@ -163,34 +201,45 @@ Source: jobs 361693 / 361694 / 361695.
 
 ## Open items (priority order)
 
-### 1. Skip the conv-recompute in `mamba2_fused` bwd
-After (4) above, the dominant cost in `mamba2_fused` bwd is recomputing
-the three width-4 convs every chunk (the kernel reloads `x`/`B`/`C`
-four times each, then re-derives `conv_x`/`conv_b`/`conv_c` and
-`sigmoid` for the SiLU bwd). Saving the post-conv pre-SiLU outputs in
-fwd (one fp32-or-bf16 tensor per branch, ~100 MB total at T=8192 B=4
-for 2 layers) lets bwd just load them. Expected: closes most of the
-remaining ~7 ms gap to `mamba2_ssd` at T=8192. File:
-`triton_kernels/mamba2_fused.py`.
+### 1. KDA isn't actually slow — it's flat
+At T=8192 B=4, KDA's *kernel* CUDA time (`fla_fwd` + `fla_bwd` ≈
+17.7 ms over 10 iters) is *less* than FlashAttention2's (~23.9 ms);
+KDA's total fwd+bwd (9.98 ms) is within 5% of full-attn (9.46 ms).
+The 9.31 → 9.98 ms flatness across T=2048→8192 is the diagnostic of a
+linear-time recurrence at constant total tokens. Inside KDA, bwd is
+3× the fwd cost and `chunk_kda_bwd_kernel_intra` alone is ~671 µs/call.
+The big ROI on KDA is *not* tweaking the chunk kernel (where we'd be
+forking 15+ FLA files for a 5–10% gain) — it's:
+(a) profiling at T≥16K where KDA's asymptotic advantage actually shows;
+(b) trimming the launch-heavy surrounding layer (3 conv1d's + 2
+`F.normalize` + `softplus` + sigmoid + RMSNorm·gate + 5 GEMMs). The
+bench already packs qkv; the training `KDALayer` does too as of
+`edc48bd`.
 
-Skip-path note: forward also runs `silu(causal_conv1d(x_ssm))` once
-for `x_skip` *and* again inside the fused kernel. Same fix —
-materialize once.
+### 2. mamba2_fused → either parallel scan or admit defeat
+The fused kernel is now within 5 ms of `mamba2_ssd` at T=8192 B=4,
+but `mamba2_ssd` is still faster because its three separate
+`causal_conv1d` kernels parallelize across `B·H·T/BLOCK_T` while the
+fused kernel's outer loop runs serially over chunks per `(B, H)` CTA.
+Only an inter-chunk parallel scan (per-chunk local outputs + chunk-summary
+scan + recompute pass) makes fused win — that's a multi-week kernel
+rewrite. Cheaper alternative: stop trying to be faster than `ssd` and
+recommend `ssd` as the default mamba2 path.
 
-### 2. State-dim ablation
+### 3. State-dim ablation
 Run `K_DIM=V_DIM ∈ {32,48,64}` and mamba2 `STATE_DIM ∈ {8,16,32}` at
 B=16 T∈{1024,2048}. Pareto vs default config. Two known constraints
 the kernels currently hit:
 - N=8 fails (Triton requires matmul tile ≥16).
 - K=V=48 fails (FLA KDA `tl.arange` requires power-of-2).
 
-### 3. Outstanding correctness regressions (independent)
+### 4. Outstanding correctness regressions (independent)
 - mamba2_ssd compiled correctness: `y` max_rel=15.5 vs reference.
 - mamba2_fused fwd+bwd `tl.fence_async_shared` PassManager fail on
   B200 (compute capability 90 hardcoded somewhere; works fine on H100).
 - FLA KDA fp32 path: `chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64`
-  PassManager fail on B200 — workaround: use bf16, which we do. Tests
-  that drive fp32 are gated.
+  PassManager fail on B200 — workaround: use bf16, which the test now
+  uses by default.
 
 ---
 
@@ -264,4 +313,6 @@ Trace JSONs land in `traces/<JOB_ID>/*.json`; load in
 
 Logs: `slurm/logs/profile-<JOB_ID>.out`.
 
-This run: jobs 361693 (T=2048), 361694 (T=4096), 361695 (T=8192).
+This run: 361802 / 361803 / 361805 (fused at T=4096 B=8, T=8192 B=4,
+T=2048 B=16) for the save-pre-SiLU fused numbers; 361693/361694/361695
+for the non-fused variants.

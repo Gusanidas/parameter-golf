@@ -178,7 +178,29 @@ def _block_t(T: int) -> int:
     return 128 if T >= 128 else triton.next_power_of_2(T)
 
 
+def _check_conv1d_shapes(x: Tensor, w: Tensor) -> None:
+    # Triton kernels use `tl.arange(0, D)` with D as a constexpr, so D must be
+    # a power of two. Without this check, mismatched shapes fail deep inside
+    # Triton with opaque codegen errors.
+    if x.ndim != 4:
+        raise ValueError(f"x must be 4D [B, T, H, D], got shape {tuple(x.shape)}")
+    if w.ndim != 3 or w.shape[-1] != 4:
+        raise ValueError(f"w must be [H, D, 4], got shape {tuple(w.shape)}")
+    if x.device != w.device:
+        raise ValueError(f"x.device={x.device} but w.device={w.device}")
+    if x.dtype != w.dtype:
+        raise ValueError(f"x.dtype={x.dtype} but w.dtype={w.dtype}")
+    H, D = w.shape[0], w.shape[1]
+    if x.shape[2] != H or x.shape[3] != D:
+        raise ValueError(
+            f"x.shape[-2:]={tuple(x.shape[-2:])} must match w.shape[:2]=({H}, {D})"
+        )
+    if D & (D - 1) != 0:
+        raise ValueError(f"feature dim D={D} must be a power of two")
+
+
 def causal_conv1d_triton(x: Tensor, w: Tensor) -> Tensor:
+    _check_conv1d_shapes(x, w)
     B, T, H, D = x.shape
     y = torch.empty_like(x)
     block_t = _block_t(T)
@@ -188,6 +210,9 @@ def causal_conv1d_triton(x: Tensor, w: Tensor) -> Tensor:
 
 
 def causal_conv1d_triton_bwd(dy: Tensor, x: Tensor, w: Tensor) -> tuple[Tensor, Tensor]:
+    _check_conv1d_shapes(x, w)
+    if dy.shape != x.shape:
+        raise ValueError(f"dy.shape={tuple(dy.shape)} must match x.shape={tuple(x.shape)}")
     B, T, H, D = x.shape
     dx = torch.empty_like(x)
     dw = torch.empty_like(w)

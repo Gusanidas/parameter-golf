@@ -37,30 +37,34 @@ def _check(name: str, got: torch.Tensor, ref: torch.Tensor,
 
 
 def run_case(B=2, T=63, H=2, K=64, V=32, seed=0,
-             compile_fullgraph=False, atol=8e-3, rtol=8e-3) -> bool:
+             dtype=torch.bfloat16,
+             compile_fullgraph=False, atol=3e-2, rtol=3e-2) -> bool:
+    """KDA correctness check.
+
+    Defaults to bf16 because FLA's KDA fp32 path triggers a Triton MLIR
+    PassManager error on Blackwell (B200). bf16 works on H100/B200 and
+    matches the dtype training actually uses.
+    """
     device = "cuda"
     gen = torch.Generator(device=device).manual_seed(seed)
 
-    def mkp(*shape):
-        return torch.randn(*shape, device=device, dtype=torch.float32,
-                           generator=gen, requires_grad=True)
-
     q = F.normalize(torch.randn(B, T, H, K, device=device,
-                                dtype=torch.float32, generator=gen),
+                                dtype=dtype, generator=gen),
                     p=2, dim=-1).detach().requires_grad_()
     k = F.normalize(torch.randn(B, T, H, K, device=device,
-                                dtype=torch.float32, generator=gen),
+                                dtype=dtype, generator=gen),
                     p=2, dim=-1).detach().requires_grad_()
-    v = mkp(B, T, H, V)
+    v = torch.randn(B, T, H, V, device=device, dtype=dtype,
+                    generator=gen).detach().requires_grad_()
     # FLA KDA expects g in log-space. Keep most cases in a realistic negative
     # range, while still allowing non-64 sequence lengths.
     g = F.logsigmoid(torch.randn(B, T, H, K, device=device,
-                                 dtype=torch.float32, generator=gen))
+                                 dtype=dtype, generator=gen))
     g = g.detach().requires_grad_()
     beta = torch.sigmoid(torch.randn(B, T, H, device=device,
-                                     dtype=torch.float32, generator=gen))
+                                     dtype=dtype, generator=gen))
     beta = beta.detach().requires_grad_()
-    do = torch.randn(B, T, H, V, device=device, dtype=torch.float32,
+    do = torch.randn(B, T, H, V, device=device, dtype=dtype,
                      generator=gen)
 
     fn = kda_triton_autograd
@@ -77,14 +81,14 @@ def run_case(B=2, T=63, H=2, K=64, V=32, seed=0,
     (y_ref * do).sum().backward()
 
     label = "compiled" if compile_fullgraph else "eager"
-    print(f"Case {label} B={B} T={T} H={H} K={K} V={V} seed={seed}")
+    print(f"Case {label} dtype={dtype} B={B} T={T} H={H} K={K} V={V} seed={seed}")
     ok = True
     ok &= _check("y",     y,      y_ref,       atol, rtol)
     ok &= _check("dq",    dq,     q2.grad,     atol, rtol)
     ok &= _check("dk",    dk,     k2.grad,     atol, rtol)
     ok &= _check("dv",    dv,     v2.grad,     atol, rtol)
-    ok &= _check("dg",    dg,     g2.grad,     2e-2, 2e-2)
-    ok &= _check("dbeta", dbeta,  beta2.grad,  2e-2, 2e-2)
+    ok &= _check("dg",    dg,     g2.grad,     5e-2, 5e-2)
+    ok &= _check("dbeta", dbeta,  beta2.grad,  5e-2, 5e-2)
     return ok
 
 

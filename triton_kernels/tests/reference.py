@@ -73,11 +73,15 @@ def mamba2_ssd_ref(
 def mamba2_fused_ref(
     x: Tensor, A_log: Tensor, B: Tensor, C: Tensor, dt: Tensor,
     conv_w_x: Tensor, conv_w_b: Tensor, conv_w_c: Tensor,
+    D_skip: Tensor | None = None,
 ) -> Tensor:
     x_c = conv_silu_ref(x, conv_w_x)
     B_c = conv_silu_ref(B, conv_w_b)
     C_c = conv_silu_ref(C, conv_w_c)
-    return mamba2_ssd_ref(x_c, A_log, B_c, C_c, dt)
+    y = mamba2_ssd_ref(x_c, A_log, B_c, C_c, dt)
+    if D_skip is not None:
+        y = y + x_c * D_skip.float()[None, None, :, None]
+    return y
 
 
 def kda_ref(
