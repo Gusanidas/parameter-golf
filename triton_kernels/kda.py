@@ -9,16 +9,25 @@ import torch
 from torch import Tensor
 
 
+_FLA_FUNCS: tuple | None = None
+
+
 def _require_fla():
-    try:
-        from fla.ops.kda.chunk_bwd import chunk_kda_bwd
-        from fla.ops.kda.chunk_fwd import chunk_kda_fwd
-    except ImportError as exc:
-        raise ImportError(
-            "kda_triton_autograd requires fla-core. Install dependencies from "
-            "requirements.txt, or `pip install fla-core`."
-        ) from exc
-    return chunk_kda_fwd, chunk_kda_bwd
+    # Cache the function pointers on first call so the per-step fwd/bwd path
+    # doesn't re-resolve `fla.ops.kda.chunk_{fwd,bwd}` through sys.modules
+    # every invocation.
+    global _FLA_FUNCS
+    if _FLA_FUNCS is None:
+        try:
+            from fla.ops.kda.chunk_bwd import chunk_kda_bwd
+            from fla.ops.kda.chunk_fwd import chunk_kda_fwd
+        except ImportError as exc:
+            raise ImportError(
+                "kda_triton_autograd requires fla-core. Install dependencies from "
+                "requirements.txt, or `pip install fla-core`."
+            ) from exc
+        _FLA_FUNCS = (chunk_kda_fwd, chunk_kda_bwd)
+    return _FLA_FUNCS
 
 
 @torch.library.custom_op("kdat::fla_fwd", mutates_args=())
