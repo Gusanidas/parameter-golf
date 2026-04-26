@@ -178,6 +178,47 @@ the kernels currently hit:
 
 ---
 
+## Attention width sweep (FA2 full-causal, B=8 T=2048, 2 layers, bf16)
+
+Job 358964. Two independent axes; otherwise identical to the
+attn_full row in the main table.
+
+### (a) MLP width — fix DIM=512, H=6, P=64, vary `MLP_MULT`
+
+| MLP_MULT | hidden | fwd ms | bwd ms | fwd+bwd ms | peak MB |
+|---|---|---|---|---|---|
+| 2 | 1024 | 1.479 | 1.601 | **3.080** | 1961 |
+| 4 | 2048 | 1.606 | 1.734 | 3.340 | 2093 |
+| 6 | 3072 | 1.686 | 1.850 | 3.536 | 2226 |
+| 8 | 4096 | 1.652 | 1.939 | 3.591 | 2357 |
+
+Going 2× → 8× hidden adds only ~17% to fwd+bwd. MLP cost is
+sub-linear in `mult` here because the GEMMs at small width are
+memory-bound and only become compute-bound past mult≈4.
+Bwd grows slightly faster than fwd because it does 2 GEMMs
+(activation grad + weight grad) per Linear.
+
+### (b) Model dim — `MLP_MULT=4`, scale `N_HEADS = DIM/64` so attn dim = DIM
+
+| DIM | H | fwd ms | bwd ms | fwd+bwd ms | peak MB |
+|---|---|---|---|---|---|
+|  384 |  6 | 1.545 | 1.592 | **3.137** | 1980 |
+|  512 |  8 | 1.678 | 1.919 | 3.597 | 2127 |
+|  768 | 12 | 1.984 | 2.660 | 4.644 | 2421 |
+| 1024 | 16 | 2.342 | 3.529 | 5.871 | 2723 |
+
+DIM 384 → 1024 is 2.67×; fwd+bwd grows 1.87×. Sub-quadratic because
+FA2 is still memory-bound at these head counts and the embed/head
+linears (vocab=8192 × DIM) cost grows only linearly. Backward grows
+faster than forward (2.22× vs 1.52×) — the residual-stream GEMMs
+double in the bwd path.
+
+Note: the DIM=512 row here uses H=8 (attn_dim=DIM), while the
+attn_full row in the main table uses H=6 (attn_dim=384). Numbers
+diverge by ~10% because of that.
+
+---
+
 ## How to reproduce
 
 ```bash
@@ -197,6 +238,9 @@ sbatch slurm/run_kernel_tests.sbatch
 
 # Standalone MLP timing
 sbatch slurm/run_mlp_probe.sbatch
+
+# Attn width / model-dim sweep (FA2 full-causal, B=8 T=2048)
+sbatch slurm/run_attn_width_sweep.sbatch
 ```
 
 Trace JSONs land in `traces/<JOB_ID>/*.json`; load in

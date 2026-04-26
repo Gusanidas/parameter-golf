@@ -10,7 +10,7 @@ has the same signature for window_size so the numbers are directly readable.
 Layout mirrors profile_mamba2.py / profile_kda.py:
     embed → N × (RMSNorm → Attention → residual → RMSNorm → MLP → residual) → head.
 
-Env vars: BSZ, SEQLEN, DIM, N_HEADS, HEAD_DIM, N_LAYERS, N_ITERS,
+Env vars: BSZ, SEQLEN, DIM, N_HEADS, HEAD_DIM, MLP_MULT, N_LAYERS, N_ITERS,
 WINDOW (0 = full causal, else sliding-window causal of that size),
 NO_COMPILE=1.
 
@@ -60,7 +60,7 @@ class AttentionLayer(nn.Module):
 
 class AttnBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, head_dim: int, window: int,
-                 mlp_mult: float = 4.0):
+                 mlp_mult: float):
         super().__init__()
         self.norm1 = RMSNorm()
         self.attn = AttentionLayer(dim, num_heads, head_dim, window)
@@ -78,11 +78,11 @@ class AttnBlock(nn.Module):
 
 class MiniModel(nn.Module):
     def __init__(self, vocab: int, dim: int, num_heads: int, head_dim: int,
-                 n_layers: int, window: int):
+                 n_layers: int, window: int, mlp_mult: float):
         super().__init__()
         self.embed = nn.Embedding(vocab, dim)
         self.blocks = nn.ModuleList([
-            AttnBlock(dim, num_heads, head_dim, window)
+            AttnBlock(dim, num_heads, head_dim, window, mlp_mult)
             for _ in range(n_layers)
         ])
         self.norm = RMSNorm()
@@ -104,6 +104,7 @@ def main() -> int:
     DIM       = int(os.environ.get("DIM", 512))
     N_HEADS   = int(os.environ.get("N_HEADS", 6))
     HEAD_DIM  = int(os.environ.get("HEAD_DIM", 64))
+    MLP_MULT  = float(os.environ.get("MLP_MULT", 4.0))
     N_LAYERS  = int(os.environ.get("N_LAYERS", 2))
     N_ITERS   = int(os.environ.get("N_ITERS", 50))
     WINDOW    = int(os.environ.get("WINDOW", 0))
@@ -113,10 +114,11 @@ def main() -> int:
 
     tag = f"FA2 window={WINDOW}" if WINDOW > 0 else "FA2 full-causal"
     print(f"Attention minimodel profile — {tag} B={BSZ} T={SEQLEN} "
-          f"D={DIM} H={N_HEADS} P={HEAD_DIM} layers={N_LAYERS} dtype={DTYPE}")
+          f"D={DIM} H={N_HEADS} P={HEAD_DIM} mlp_mult={MLP_MULT} "
+          f"layers={N_LAYERS} dtype={DTYPE}")
 
     torch.manual_seed(0)
-    model = MiniModel(VOCAB, DIM, N_HEADS, HEAD_DIM, N_LAYERS, WINDOW)
+    model = MiniModel(VOCAB, DIM, N_HEADS, HEAD_DIM, N_LAYERS, WINDOW, MLP_MULT)
     model = model.to(device="cuda", dtype=DTYPE)
 
     if not NO_COMPILE:
