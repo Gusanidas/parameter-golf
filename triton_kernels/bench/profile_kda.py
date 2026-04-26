@@ -20,6 +20,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.profiler import record_function
 
 from triton_kernels.conv1d import causal_conv1d_autograd
 from triton_kernels.kda import kda_triton_autograd
@@ -37,18 +38,10 @@ class KDALayer(nn.Module):
         self.k_dim = k_dim
         self.v_dim = v_dim
         H, K, V = num_heads, k_dim, v_dim
-        self.q_proj = nn.Linear(dim, H * K, bias=False)
-        self.k_proj = nn.Linear(dim, H * K, bias=False)
-        self.v_proj = nn.Linear(dim, H * V, bias=False)
-        self.f_proj = nn.Sequential(
-            nn.Linear(dim, V, bias=False),
-            nn.Linear(V, H * K, bias=False),
-        )
+        self.qkv_proj = nn.Linear(dim, 2 * H * K + H * V, bias=False)
+        self.f_proj = nn.Linear(dim, H * K, bias=False)
         self.b_proj = nn.Linear(dim, H, bias=False)
-        self.g_proj = nn.Sequential(
-            nn.Linear(dim, V, bias=False),
-            nn.Linear(V, H * V, bias=True),
-        )
+        self.g_proj = nn.Linear(dim, H * V, bias=True)
         self.o_norm_weight = nn.Parameter(torch.ones(V, dtype=torch.float32))
         self.out_proj = nn.Linear(num_heads * v_dim, dim, bias=False)
         self.A_log = nn.Parameter(torch.empty(H, dtype=torch.float32).uniform_(1.0, 16.0).log())
@@ -64,9 +57,11 @@ class KDALayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, D = x.shape
         H, K, V = self.num_heads, self.k_dim, self.v_dim
-        q = self.q_proj(x).reshape(B, T, H, K)
-        k = self.k_proj(x).reshape(B, T, H, K)
-        v = self.v_proj(x).reshape(B, T, H, V)
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split([H * K, H * K, H * V], dim=-1)
+        q = q.reshape(B, T, H, K)
+        k = k.reshape(B, T, H, K)
+        v = v.reshape(B, T, H, V)
         q = F.silu(causal_conv1d_autograd(q, self.q_conv_w))
         k = F.silu(causal_conv1d_autograd(k, self.k_conv_w))
         v = F.silu(causal_conv1d_autograd(v, self.v_conv_w))
@@ -93,9 +88,12 @@ class KDABlock(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.kda(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
+        with record_function("mixer"):
+            h = self.kda(self.norm1(x))
+        x = x + h
+        with record_function("mlp"):
+            h = self.mlp(self.norm2(x))
+        return x + h
 
 
 class MiniModel(nn.Module):

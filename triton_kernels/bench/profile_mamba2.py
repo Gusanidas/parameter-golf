@@ -20,6 +20,7 @@ import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.profiler import record_function
 
 from triton_kernels.mamba2_ssd import mamba2_ssd_triton_autograd
 from triton_kernels.mamba2_fused import mamba2_fused_triton_autograd
@@ -93,9 +94,12 @@ class Mamba2Block(nn.Module):
         self.mlp = MLP(dim, mlp_mult)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.mamba(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
+        with record_function("mixer"):
+            h = self.mamba(self.norm1(x))
+        x = x + h
+        with record_function("mlp"):
+            h = self.mlp(self.norm2(x))
+        return x + h
 
 
 class MiniModel(nn.Module):

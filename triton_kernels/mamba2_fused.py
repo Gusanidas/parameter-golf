@@ -170,7 +170,21 @@ def _mamba2_fused_fwd(
 # 2. SSD backward → d_ssd (gradients w.r.t. post-SiLU values)
 # 3. SiLU backward → d_conv (gradients w.r.t. conv outputs)
 # 4. Store d_conv — conv transpose + dW done by separate conv1d_bwd kernels
+#
+# SMEM: B200 cap is 232,448 B. With Triton's default num_stages=3 the bwd
+# allocates ~304 KB and triggers OutOfResources. Pin a single low-stage config
+# (num_stages=1, num_warps=4) keyed by the constexpr block dims so it fits in
+# ≤227 KB SMEM on Blackwell while staying portable to H100.
 
+@triton.autotune(
+    configs=[
+        # num_stages=1 avoids the multi-stage SMEM doubling that pushes us over
+        # the 232,448 B Blackwell cap. The kernel's per-chunk loop body is
+        # arithmetic-heavy and gains little from pipelining anyway.
+        triton.Config({}, num_stages=1, num_warps=4),
+    ],
+    key=["CHUNK", "HDIM", "SDIM"],
+)
 @triton.jit
 def _mamba2_fused_bwd(
     # Raw inputs (still needed for conv_bwd elsewhere; strides reused for CONV_* too)
